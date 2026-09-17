@@ -68,7 +68,7 @@ Open Wireshark, press <kbd>F5</kbd>, and double-click the board.
 firmware/     ESP-IDF project for the ESP32-C5 (the sniffer itself)
 extcap/       the Wireshark plugin, and install.py which registers it
 host/         sniffer.py, for captures from the command line
-wireshark/    the WLAN-detail Wireshark profile (columns, colours, filter buttons)
+wireshark/    the ESP32-Sniffer Wireshark profile (columns, colours, filter buttons)
 docs/         the documentation site and the browser flasher
 tests/        offline tests for the PCAP framing and the toolbar protocol
 ```

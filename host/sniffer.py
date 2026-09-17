@@ -51,7 +51,7 @@ START_RETRY_S = 2.0
 WIRESHARK_STARTUP_S = 60.0
 WIRESHARK_STALL_S = 10.0
 
-DEFAULT_PROFILE = "WLAN-detail"
+DEFAULT_PROFILE = "ESP32-Sniffer"
 # The profile that ships with this project: Wi-Fi columns (channel, rate, signal, SSID, BSSID),
 # colouring rules and the Wi-Fi filter buttons. Copied from wireshark/profiles/ on first use.
 PROFILE_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),

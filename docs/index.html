@@ -94,7 +94,7 @@
          alt="Wireshark capturing from two ESP32 sniffer interfaces at once, showing Wi-Fi columns for PHY type, channel, rate, frequency, signal and noise.">
     <figcaption>
       Two boards captured at once and merged into one window. The columns and the Wi-Fi filter buttons
-      along the top come from the <code>WLAN-detail</code> profile that installs with the tool.
+      along the top come from the <code>ESP32-Sniffer</code> profile that installs with the tool.
     </figcaption>
   </figure>
 
@@ -132,7 +132,7 @@ pip install -r requirements.txt
 python extcap/install.py</code></pre>
   <p>
     That installs a small launcher into Wireshark&rsquo;s <code>extcap</code> folder and the
-    <strong>WLAN-detail</strong> Wireshark profile (Wi-Fi columns, colouring rules and filter buttons
+    <strong>ESP32-Sniffer</strong> Wireshark profile (Wi-Fi columns, colouring rules and filter buttons
     for beacons by Wi-Fi generation, probes, auth, RTS/CTS, ACKs, EAPOL and more). An existing profile
     of that name is never overwritten.
   </p>
@@ -146,6 +146,15 @@ python extcap/install.py</code></pre>
     <li>Turn on <em>View &rarr; Interface Toolbars &rarr; ESP32 Wi-Fi sniffer</em> to change channels
         while capturing.</li>
   </ol>
+
+  <figure>
+    <img src="images/interface-option.png"
+         alt="Three ESP32 boards in Wireshark's interface list; the interface options dialog showing the serial port picker and the channel tick list with a drop-down of ready-made channel lists.">
+    <figcaption>
+      Three boards in the interface list, the serial port picker, and the channels as a tick list with
+      ready-made lists to choose from. Tick a band heading to take the whole band.
+    </figcaption>
+  </figure>
 
   <figure>
     <img src="images/interface-toolbar.png"

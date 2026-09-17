@@ -19,7 +19,7 @@ NAME = "esp32_sniffer"
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLUGIN = os.path.join(REPO, "extcap", NAME + ".py")
 
-PROFILE_NAME = "WLAN-detail"
+PROFILE_NAME = "ESP32-Sniffer"
 PROFILE_SRC = os.path.join(REPO, "wireshark", "profiles", PROFILE_NAME)
 
 
@@ -53,7 +53,7 @@ def profiles_dir():
 
 
 def install_profile(force=False):
-    """Put the WLAN-detail Wireshark profile in place: the columns, colours and Wi-Fi filter buttons."""
+    """Put the Wireshark profile in place: the Wi-Fi columns, colours and filter buttons."""
     if not os.path.isdir(PROFILE_SRC):
         print("[!] No profile in the repository at %s" % PROFILE_SRC)
         return None
