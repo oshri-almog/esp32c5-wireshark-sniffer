@@ -102,9 +102,7 @@ def groups_for(mode):
 
 
 def channel_ok_for(mode, channel):
-    if mode == MODE_154:
-        return 11 <= channel <= 26
-    return ss.channel_is_valid(channel)
+    return ss.channel_is_valid(channel, mode)
 
 # Ready-made channel lists for the toolbar and the settings dialog
 PRESETS = [
@@ -127,10 +125,10 @@ def out(line):
     sys.stdout.write(line + "\n")
 
 
-def parse_channel_spec_safe(spec):
+def parse_channel_spec_safe(spec, mode=MODE_WIFI):
     """parse_channel_spec but never raises: used where a bad value should not stop the plugin."""
     try:
-        return ss.parse_channel_spec(spec)
+        return ss.parse_channel_spec(spec, mode)
     except ValueError:
         return []
 
@@ -272,7 +270,7 @@ def extcap_config(interface):
             % (p.device, board_label(p, mode), "{default=true}" if p.device == current else ""))
 
     # Tick list of channels, grouped by band. Ticking a heading takes everything under it.
-    default_ticks = set(parse_channel_spec_safe(MODES[mode]["default_channels"]))
+    default_ticks = set(parse_channel_spec_safe(MODES[mode]["default_channels"], mode))
     # {required=true} matters: without it Wireshark leaves the option out entirely when the ticks happen to
     # match the defaults, and the plugin would never hear what was chosen.
     out("arg {number=1}{call=--channels}{display=Channels to scan}{type=multicheck}{group=Scanning}"
@@ -395,7 +393,8 @@ def extcap_capture(interface, fifo_path, port, channels, dwell, mode=MODE_WIFI):
             return
         try:
             if key == "channels":
-                picked = ss.parse_channel_spec(value)      # refuse nonsense before the board sees it
+                # Refuse nonsense before the board sees it, in this radio's own numbering
+                picked = ss.parse_channel_spec(value, state["mode"])
                 bad = [c for c in picked if not channel_ok_for(state["mode"], c)]
                 if bad:
                     raise ValueError("channel %d is not valid for this radio" % bad[0])
@@ -562,13 +561,14 @@ def main():
             args.channels = MODES[mode]["default_channels"]  # the Wi-Fi default means nothing here
         if args.preset and mode == MODE_WIFI:
             channels = args.preset                      # a ready-made list wins over the ticks
-            if not parse_channel_spec_safe(channels):
+            if not parse_channel_spec_safe(channels, mode):
                 sys.exit("Channels: %r is not a channel list" % channels)
         else:
             # The tick list hands back something like "g24,1,6,11"; a typed spec such as "1-11" also works,
             # so both the dialog and the command line are accepted here.
             ticked = (channels_from_ticks(args.channels, mode)
-                      or [c for c in parse_channel_spec_safe(args.channels) if channel_ok_for(mode, c)])
+                      or [c for c in parse_channel_spec_safe(args.channels, mode)
+                          if channel_ok_for(mode, c)])
             if not ticked:
                 sys.exit("No channels selected. Tick at least one in the interface settings (the gear icon).")
             channels = ",".join(str(c) for c in ticked)

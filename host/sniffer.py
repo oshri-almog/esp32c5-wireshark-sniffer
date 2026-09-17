@@ -62,20 +62,31 @@ PROFILE_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 # Channel lists
 # ----------------------------------------------------------------------------------------------
 
-def channel_is_valid(ch):
-    """The channels an ESP32 radio can tune to (same rule as the firmware)."""
+MODE_WIFI, MODE_154 = "wifi", "802154"
+
+
+def channel_is_valid(ch, mode=MODE_WIFI):
+    """The channels an ESP32 radio can tune to (same rule as the firmware).
+
+    The two radios number their channels differently and the ranges overlap, so 11 to 14 mean one
+    thing on Wi-Fi and another on 802.15.4. Which radio is meant has to be said, not guessed.
+    """
+    if mode == MODE_154:
+        return 11 <= ch <= 26
     return (1 <= ch <= 14
             or (36 <= ch <= 64 and (ch - 36) % 4 == 0)
             or (100 <= ch <= 144 and (ch - 100) % 4 == 0)
             or (149 <= ch <= 177 and (ch - 149) % 4 == 0))
 
 
-def parse_channel_spec(spec):
+def parse_channel_spec(spec, mode=MODE_WIFI):
     """Turn "6", "1,6,11", "1-11" or "1-13,36,149-165" into an ordered list of channels.
 
     A single number has to be a real channel; a range keeps the real channels inside it, so "36-64"
     gives 36, 40 ... 64. Duplicates are dropped so no channel gets two turns in a lap.
     """
+    what = "802.15.4" if mode == MODE_154 else "Wi-Fi"
+    allowed = "11-26" if mode == MODE_154 else "1-14, or 36-177 in steps of 4"
     channels = []
     for part in str(spec).split(","):
         part = part.strip()
@@ -89,16 +100,16 @@ def parse_channel_spec(spec):
                 raise ValueError("%r is not a channel range like 1-11" % part)
             if high < low:
                 raise ValueError("the range %r runs backwards" % part)
-            picked = [c for c in range(low, high + 1) if channel_is_valid(c)]
+            picked = [c for c in range(low, high + 1) if channel_is_valid(c, mode)]
             if not picked:
-                raise ValueError("no Wi-Fi channels in the range %r" % part)
+                raise ValueError("no %s channels in the range %r" % (what, part))
         else:
             try:
                 channel = int(part)
             except ValueError:
                 raise ValueError("%r is not a channel number" % part)
-            if not channel_is_valid(channel):
-                raise ValueError("%d is not a Wi-Fi channel (1-14, or 36-177 in steps of 4)" % channel)
+            if not channel_is_valid(channel, mode):
+                raise ValueError("%d is not a %s channel (%s)" % (channel, what, allowed))
             picked = [channel]
         for c in picked:
             if c not in channels:
@@ -408,6 +419,9 @@ def parse_args():
                          "(1-13,36,149-165). Default: whatever the firmware was built with.")
     ap.add_argument("-d", "--dwell", type=int, metavar="MS",
                     help="time spent on each channel before hopping to the next one, in ms")
+    ap.add_argument("-m", "--mode", choices=["wifi", "802154"],
+                    help="radio to capture with: wifi, or 802154 for Zigbee and Thread. The board "
+                         "reboots if this is not the one it is already using. Default: leave it alone.")
     ap.add_argument("--reset", action="store_true", help="reset the board (RTS pulse) after opening the port")
     ap.add_argument("--no-handshake", action="store_true",
                     help="only wait for the <<START>> line printed at boot (original Arduino firmware)")
@@ -423,7 +437,7 @@ def parse_args():
     args = ap.parse_args()
     if args.channels is not None:
         try:
-            channels = parse_channel_spec(args.channels)
+            channels = parse_channel_spec(args.channels, args.mode or MODE_WIFI)
         except ValueError as e:
             ap.error("--channels: %s" % e)
         print("[i] Scanning %d channel(s): %s"
@@ -478,6 +492,15 @@ def main():
     def send_start():
         nonlocal nonce, last_start, start_attempts
         nonce = secrets.token_hex(4).encode()  # tells the answer to this START from older markers
+        # The radio, if one was asked for. Sent on its own and first: the board reboots when this is
+        # not the radio it booted with, and the channel numbering differs between the two. Without
+        # --mode the board is left on whatever radio it is already using.
+        if args.mode:
+            try:
+                ser.write(b"MODE %s\n" % args.mode.encode())
+                time.sleep(0.3)
+            except (serial.SerialException, OSError):
+                pass  # a reboot is one of the ways this fails; the main loop reconnects
         # The channel list outlives this script, so always say what is wanted:
         # "CHANNELS 0" restores the firmware's own list and undoes an earlier --channels.
         cmd = b"CHANNELS %s\n" % (args.channels or "0").encode()
