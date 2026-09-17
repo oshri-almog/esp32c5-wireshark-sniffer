@@ -42,11 +42,40 @@ DEFAULT_CHANNELS = "1,6,11"
 DEFAULT_DWELL = 250
 
 LINKTYPE_IEEE802_11_RADIOTAP = 127
+LINKTYPE_IEEE802_15_4_TAP = 283
+
+# A board can listen with its Wi-Fi radio or with its 802.15.4 one, but not both: they share the
+# antenna path and 802.15.4 loses the arbitration, so running both would quietly drop frames. Each
+# board therefore offers one interface per radio, and only one of them can capture at a time.
+MODE_WIFI, MODE_154 = "wifi", "802154"
+MODES = {
+    MODE_WIFI: {
+        "suffix": "",
+        "label": "Wi-Fi sniffer",
+        "linktype": LINKTYPE_IEEE802_11_RADIOTAP,
+        "dlt_name": "IEEE802_11_RADIOTAP",
+        "dlt_display": "802.11 plus radiotap header",
+        "default_channels": "1,6,11",
+    },
+    MODE_154: {
+        "suffix": "-154",
+        "label": "Zigbee/Thread sniffer",
+        "linktype": LINKTYPE_IEEE802_15_4_TAP,
+        "dlt_name": "IEEE802_15_4_TAP",
+        "dlt_display": "IEEE 802.15.4 plus TAP pseudo-header",
+        "default_channels": "11-26",
+    },
+}
 # The PCAP file header Wireshark expects before any packet. We send it ourselves the moment the capture
 # starts, instead of waiting to pass on the one the board sends: Wireshark does not show a single packet
 # from ANY interface until every interface in the capture has produced its header, so a board that is
 # unplugged or slow to answer would otherwise hold up all the others.
-PCAP_GLOBAL_HDR = struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, LINKTYPE_IEEE802_11_RADIOTAP)
+def pcap_global_header(linktype):
+    return struct.pack("<IHHIIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, linktype)
+
+CHANNEL_GROUPS_154 = [
+    ("g154", "802.15.4 (Zigbee and Thread)", list(range(11, 27))),
+]
 
 # Every channel the radio can tune to, grouped the way they are shown in the tick list
 CHANNEL_GROUPS = [
@@ -55,7 +84,22 @@ CHANNEL_GROUPS = [
     ("g5mid", "5 GHz middle (UNII-2C, radar)", list(range(100, 145, 4))),
     ("g5high", "5 GHz high (UNII-3)", list(range(149, 178, 4))),
 ]
-GROUP_IDS = {gid for gid, _, _ in CHANNEL_GROUPS}
+GROUP_IDS = {gid for gid, _, _ in CHANNEL_GROUPS + CHANNEL_GROUPS_154}
+
+
+def mode_of(interface):
+    """Which radio an interface name asks for."""
+    return MODE_154 if (interface or "").endswith(MODES[MODE_154]["suffix"]) else MODE_WIFI
+
+
+def groups_for(mode):
+    return CHANNEL_GROUPS_154 if mode == MODE_154 else CHANNEL_GROUPS
+
+
+def channel_ok_for(mode, channel):
+    if mode == MODE_154:
+        return 11 <= channel <= 26
+    return ss.channel_is_valid(channel)
 
 # Ready-made channel lists for the toolbar and the settings dialog
 PRESETS = [
@@ -86,7 +130,7 @@ def parse_channel_spec_safe(spec):
         return []
 
 
-def channels_from_ticks(raw):
+def channels_from_ticks(raw, mode=MODE_WIFI):
     """Turn what a tick list hands back into a channel list.
 
     Wireshark sends the ticked values comma separated. The group headings are ticked values too, so they
@@ -104,7 +148,7 @@ def channels_from_ticks(raw):
             channel = int(token)
         except ValueError:
             continue  # something we do not recognise: better to ignore than to refuse the capture
-        if ss.channel_is_valid(channel) and channel not in channels:
+        if channel_ok_for(mode, channel) and channel not in channels:
             channels.append(channel)
 
     # A ticked heading may arrive on its own, or next to the channels under it. Only fall back to
@@ -112,7 +156,7 @@ def channels_from_ticks(raw):
     # never turns into the whole band.
     if not channels:
         for gid in groups:
-            for group_id, _, members in CHANNEL_GROUPS:
+            for group_id, _, members in groups_for(mode):
                 if group_id == gid:
                     channels.extend(m for m in members if m not in channels)
     return channels
@@ -133,7 +177,7 @@ def natural_key(device):
     return (device[:m.start()] if m else device, int(m.group(1)) if m else 0)
 
 
-def board_id(port_info):
+def board_id(port_info, mode=MODE_WIFI):
     """A name for the board that survives it moving to another USB socket.
 
     Most boards report their MAC address as the USB serial number, which is perfect. The ones that
@@ -141,26 +185,33 @@ def board_id(port_info):
     """
     serial = (port_info.serial_number or "").strip()
     if re.fullmatch(r"(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}", serial):
-        return "esp32-" + serial.replace(":", "").replace("-", "").lower()
-    return "esp32-" + (port_info.device or "unknown").lower()
+        base = "esp32-" + serial.replace(":", "").replace("-", "").lower()
+    else:
+        base = "esp32-" + (port_info.device or "unknown").lower()
+    return base + MODES[mode]["suffix"]
 
 
-def board_label(port_info):
+def board_label(port_info, mode=MODE_WIFI):
     serial = (port_info.serial_number or "").strip()
+    what = MODES[mode]["label"]
     if re.fullmatch(r"(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}", serial):
-        return "ESP32 Wi-Fi sniffer (%s, %s)" % (port_info.device, serial.upper())
-    return "ESP32 Wi-Fi sniffer (%s)" % port_info.device
+        return "ESP32 %s (%s, %s)" % (what, port_info.device, serial.upper())
+    return "ESP32 %s (%s)" % (what, port_info.device)
 
 
 def port_for_interface(interface, explicit_port):
     """Work out which serial port to talk to. The port chosen in the settings dialog always wins."""
     if explicit_port:
         return explicit_port
+    mode = mode_of(interface)
     for p in find_boards():
-        if board_id(p) == interface:
+        if board_id(p, mode) == interface:
             return p.device
     # The board was unplugged, or moved and reports no serial number: fall back to the name it had.
-    m = re.fullmatch(r"esp32-((?:com|tty|cu\.)\S+)", interface or "", re.IGNORECASE)
+    bare = (interface or "")
+    if bare.endswith(MODES[MODE_154]["suffix"]):
+        bare = bare[:-len(MODES[MODE_154]["suffix"])]
+    m = re.fullmatch(r"esp32-((?:com|tty|cu\.)\S+)", bare, re.IGNORECASE)
     if m:
         return m.group(1).upper() if m.group(1).lower().startswith("com") else m.group(1)
     return None
@@ -171,10 +222,13 @@ def port_for_interface(interface, explicit_port):
 # ----------------------------------------------------------------------------------------------
 
 def extcap_interfaces():
-    out("extcap {version=1.0}{display=ESP32 Wi-Fi sniffer}"
-        "{help=https://github.com/oshri-almog/Packet-Sniffer-ESP32}")
+    out("extcap {version=1.0}{display=ESP32 sniffer}"
+        "{help=https://github.com/oshri-almog/esp32c5-wireshark-sniffer}")
+    # Each board appears once per radio: Wi-Fi and 802.15.4 (Zigbee/Thread). Only one of the two can
+    # capture at a time, because they share the antenna.
     for p in find_boards():
-        out("interface {value=%s}{display=%s}" % (board_id(p), board_label(p)))
+        for mode in (MODE_WIFI, MODE_154):
+            out("interface {value=%s}{display=%s}" % (board_id(p, mode), board_label(p, mode)))
 
     # The toolbar under View -> Interface Toolbars
     out("control {number=%d}{type=selector}{display=Channels}"
@@ -194,12 +248,13 @@ def extcap_interfaces():
             % (CTRL_PRESET, value, display, "{default=true}" if value == DEFAULT_CHANNELS else ""))
 
 
-def extcap_dlts():
-    out("dlt {number=%d}{name=IEEE802_11_RADIOTAP}{display=802.11 plus radiotap header}"
-        % LINKTYPE_IEEE802_11_RADIOTAP)
+def extcap_dlts(interface):
+    m = MODES[mode_of(interface)]
+    out("dlt {number=%d}{name=%s}{display=%s}" % (m["linktype"], m["dlt_name"], m["dlt_display"]))
 
 
 def extcap_config(interface):
+    mode = mode_of(interface)
     boards = find_boards()
     current = port_for_interface(interface, None)
 
@@ -209,16 +264,16 @@ def extcap_config(interface):
         out("value {arg=0}{value=}{display=no ESP32 found - plug one in and reopen this dialog}{default=true}")
     for p in boards:
         out("value {arg=0}{value=%s}{display=%s}%s"
-            % (p.device, board_label(p), "{default=true}" if p.device == current else ""))
+            % (p.device, board_label(p, mode), "{default=true}" if p.device == current else ""))
 
-    # Tick list of channels, grouped by band. Ticking a band heading takes the whole band.
-    default_ticks = set(parse_channel_spec_safe(DEFAULT_CHANNELS))
+    # Tick list of channels, grouped by band. Ticking a heading takes everything under it.
+    default_ticks = set(parse_channel_spec_safe(MODES[mode]["default_channels"]))
     # {required=true} matters: without it Wireshark leaves the option out entirely when the ticks happen to
     # match the defaults, and the plugin would never hear what was chosen.
     out("arg {number=1}{call=--channels}{display=Channels to scan}{type=multicheck}{group=Scanning}"
         "{required=true}"
-        "{tooltip=Tick the channels to scan. Tick a band heading to take all of it.}")
-    for gid, gname, members in CHANNEL_GROUPS:
+        "{tooltip=Tick the channels to scan. Tick a heading to take all of them.}")
+    for gid, gname, members in groups_for(mode):
         out("value {arg=1}{value=%s}{display=%s}{enabled=true}" % (gid, gname))
         for ch in members:
             out("value {arg=1}{value=%d}{display=Channel %d}{enabled=true}{parent=%s}%s"
@@ -228,11 +283,12 @@ def extcap_config(interface):
         "{default=%d}{group=Scanning}"
         "{tooltip=Time spent on each channel. Ignored when only one channel is ticked.}"
         % DEFAULT_DWELL)
-    out("arg {number=3}{call=--preset}{display=Or a ready-made list}{type=selector}{group=Scanning}"
-        "{tooltip=Anything other than Custom overrides the ticks above}")
-    out("value {arg=3}{value=}{display=Custom (use the ticks above)}{default=true}")
-    for value, display in PRESETS:
-        out("value {arg=3}{value=%s}{display=%s}" % (value, display))
+    if mode == MODE_WIFI:
+        out("arg {number=3}{call=--preset}{display=Or a ready-made list}{type=selector}{group=Scanning}"
+            "{tooltip=Anything other than Custom overrides the ticks above}")
+        out("value {arg=3}{value=}{display=Custom (use the ticks above)}{default=true}")
+        for value, display in PRESETS:
+            out("value {arg=3}{value=%s}{display=%s}" % (value, display))
 
 
 # ----------------------------------------------------------------------------------------------
@@ -315,7 +371,7 @@ class ControlPipes:
 # Capture
 # ----------------------------------------------------------------------------------------------
 
-def extcap_capture(interface, fifo_path, port, channels, dwell):
+def extcap_capture(interface, fifo_path, port, channels, dwell, mode=MODE_WIFI):
     if not port:
         sys.exit("No ESP32 found for interface %r. Plug the board in, or choose the serial port "
                  "in the interface settings (the gear icon)." % interface)
@@ -323,7 +379,7 @@ def extcap_capture(interface, fifo_path, port, channels, dwell):
     control = ControlPipes(getattr(extcap_capture, "control_in", None),
                            getattr(extcap_capture, "control_out", None),
                            on_change=lambda k, v: settings_changed(k, v))
-    state = {"serial": None, "channels": channels, "dwell": dwell, "packets": 0}
+    state = {"serial": None, "channels": channels, "dwell": dwell, "packets": 0, "mode": mode}
 
     def settings_changed(key, value):
         if key == "initialized":
@@ -334,7 +390,10 @@ def extcap_capture(interface, fifo_path, port, channels, dwell):
             return
         try:
             if key == "channels":
-                ss.parse_channel_spec(value)               # refuse nonsense before the board sees it
+                picked = ss.parse_channel_spec(value)      # refuse nonsense before the board sees it
+                bad = [c for c in picked if not channel_ok_for(state["mode"], c)]
+                if bad:
+                    raise ValueError("channel %d is not valid for this radio" % bad[0])
                 ser.write(b"CHANNELS %s\n" % value.encode())
                 state["channels"] = value
             elif key == "dwell":
@@ -361,10 +420,10 @@ def extcap_capture(interface, fifo_path, port, channels, dwell):
     scanner, framer = ss.MarkerScanner(), ss.PcapFramer()
     # Claiming the link type up front also stops the framer passing the board's own header on, which
     # would be a second header in the middle of the stream.
-    framer.linktype = LINKTYPE_IEEE802_11_RADIOTAP
+    framer.linktype = MODES[mode]["linktype"]
     synced, nonce, last_start = False, None, 0.0
     fifo = open(fifo_path, "wb")
-    fifo.write(PCAP_GLOBAL_HDR)
+    fifo.write(pcap_global_header(MODES[mode]["linktype"]))
     fifo.flush()
     try:
         while True:
@@ -409,6 +468,14 @@ def extcap_capture(interface, fifo_path, port, channels, dwell):
 def send_start(ser, state):
     import secrets
     nonce = secrets.token_hex(4).encode()
+    # MODE first and on its own: it decides the link type, and switching radios takes a moment.
+    # The channel numbering differs between the two, so the channel list must follow, not precede it.
+    cmd = b"MODE %s\n" % (b"802154" if state["mode"] == MODE_154 else b"WIFI")
+    try:
+        ser.write(cmd)
+        time.sleep(0.8)
+    except (OSError, ValueError):
+        pass
     cmd = b"CHANNELS %s\n" % str(state["channels"]).encode()
     cmd += b"DWELL %d\n" % int(state["dwell"])
     cmd += b"START %d %s\n" % (time.time_ns() // 1000, nonce)
@@ -463,7 +530,7 @@ def main():
         extcap_interfaces()
         return 0
     if args.extcap_dlts:
-        extcap_dlts()
+        extcap_dlts(args.extcap_interface)
         return 0
     if args.extcap_config:
         extcap_config(args.extcap_interface)
@@ -471,21 +538,25 @@ def main():
     if args.capture:
         if not args.fifo:
             sys.exit("--capture needs --fifo")
-        if args.preset:
+        mode = mode_of(args.extcap_interface)
+        if args.channels == DEFAULT_CHANNELS and mode == MODE_154:
+            args.channels = MODES[mode]["default_channels"]  # the Wi-Fi default means nothing here
+        if args.preset and mode == MODE_WIFI:
             channels = args.preset                      # a ready-made list wins over the ticks
             if not parse_channel_spec_safe(channels):
                 sys.exit("Channels: %r is not a channel list" % channels)
         else:
             # The tick list hands back something like "g24,1,6,11"; a typed spec such as "1-11" also works,
             # so both the dialog and the command line are accepted here.
-            ticked = channels_from_ticks(args.channels) or parse_channel_spec_safe(args.channels)
+            ticked = (channels_from_ticks(args.channels, mode)
+                      or [c for c in parse_channel_spec_safe(args.channels) if channel_ok_for(mode, c)])
             if not ticked:
                 sys.exit("No channels selected. Tick at least one in the interface settings (the gear icon).")
             channels = ",".join(str(c) for c in ticked)
         extcap_capture.control_in = args.extcap_control_in
         extcap_capture.control_out = args.extcap_control_out
         extcap_capture(args.extcap_interface, args.fifo,
-                       port_for_interface(args.extcap_interface, args.port), channels, args.dwell)
+                       port_for_interface(args.extcap_interface, args.port), channels, args.dwell, mode)
         return 0
     ap.print_help()
     return 0
