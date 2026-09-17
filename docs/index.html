@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32-C5 Wireshark Sniffer</title>
+<meta name="description" content="Turn ESP32-C5 boards into dual-band Wi-Fi sniffers that appear as capture interfaces inside Wireshark. Flash one from your browser.">
+
+<!-- Pinned deliberately. esp-web-tools 10.2.x bundles esptool-js 0.5.6, which cannot flash an
+     ESP32-C5 through its native USB-Serial-JTAG port (esphome/esp-web-tools#687). 10.3.0 and later
+     bundle esptool-js 0.6.0, which fixes it. Our boards are exactly the affected case. -->
+<script type="module" src="https://unpkg.com/esp-web-tools@10.4.0/dist/web/install-button.js?module"></script>
+
+<style>
+  :root {
+    --bg:#fff; --fg:#1b1f24; --muted:#5b6570; --card:#f6f8fa; --line:#d0d7de;
+    --accent:#0969da; --warn-bg:#fff8c5; --warn-line:#d4a72c; --ok-bg:#dafbe1; --ok-line:#2da44e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#0d1117; --fg:#e6edf3; --muted:#9198a1; --card:#161b22; --line:#30363d;
+      --accent:#4493f8; --warn-bg:#2d2611; --warn-line:#9e7b0b; --ok-bg:#12261a; --ok-line:#2da44e;
+    }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:40px 16px; background:var(--bg); color:var(--fg);
+         font:16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width:820px; margin:0 auto; }
+  h1 { font-size:2rem; line-height:1.2; margin:0 0 10px; }
+  h2 { font-size:1.3rem; margin:36px 0 12px; padding-bottom:6px; border-bottom:1px solid var(--line); }
+  h3 { font-size:1.05rem; margin:24px 0 8px; }
+  .sub { color:var(--muted); font-size:1.08rem; margin:0 0 28px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:22px; margin:0 0 20px; }
+  .warn { background:var(--warn-bg); border:1px solid var(--warn-line); border-radius:10px; padding:16px 18px; margin:18px 0; }
+  .ok { background:var(--ok-bg); border:1px solid var(--ok-line); border-radius:10px; padding:16px 18px; margin:18px 0; }
+  code { background:var(--line); padding:2px 6px; border-radius:4px; font-size:.9em; }
+  pre { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px 16px; overflow-x:auto; }
+  pre code { background:none; padding:0; }
+  a { color:var(--accent); }
+  ol, ul { padding-left:24px; }
+  li + li { margin-top:7px; }
+  .cta { text-align:center; padding:10px 0 2px; }
+  esp-web-install-button { --esp-tools-button-color:#fff; --esp-tools-button-background-color:var(--accent); }
+  table { width:100%; border-collapse:collapse; margin:14px 0; font-size:.95rem; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; }
+  img { max-width:100%; border:1px solid var(--line); border-radius:8px; }
+  figure { margin:18px 0; }
+  figcaption { color:var(--muted); font-size:.9rem; margin-top:8px; }
+  .muted { color:var(--muted); font-size:.92rem; }
+  footer { margin-top:48px; padding-top:18px; border-top:1px solid var(--line); color:var(--muted); font-size:.9rem; }
+</style>
+</head>
+<body>
+<main>
+
+  <h1>ESP32-C5 Wireshark Sniffer</h1>
+  <p class="sub">
+    Turn cheap ESP32-C5 boards into dual-band (2.4&nbsp;GHz + 5&nbsp;GHz) Wi-Fi sniffers that show up
+    as ordinary capture interfaces inside Wireshark &mdash; with a toolbar for changing channels while
+    the capture runs, and support for several boards at once.
+  </p>
+
+  <div class="card">
+    <h3 style="margin-top:0">Flash a board from this page</h3>
+    <p>
+      Plug an ESP32-C5 into a USB port using its <strong>native USB</strong> connector, then press the
+      button. Nothing to install.
+    </p>
+    <div class="cta">
+      <esp-web-install-button manifest="manifest.json">
+        <button slot="activate">Connect and flash</button>
+        <span slot="unsupported">
+          This browser cannot talk to serial devices. Use Chrome or Edge 89+ (or Firefox 151+).
+          Safari is not supported &mdash; see the manual flashing instructions below.
+        </span>
+        <span slot="not-allowed">Serial access is not allowed on this page.</span>
+      </esp-web-install-button>
+    </div>
+    <p class="muted" style="text-align:center;margin-bottom:0">
+      Chrome / Edge 89+, Firefox 151+, Chrome for Android. Not Safari.
+    </p>
+  </div>
+
+  <div class="warn">
+    <strong>If the board does not start sniffing after flashing.</strong>
+    Some boards come up latched in download mode and never run the new firmware. Unplug it and plug it
+    back in, or press its <code>BOOT</code> button once. This is a quirk of the board, not the
+    firmware &mdash; it happened on two of the three boards this tool was developed against.
+  </div>
+
+  <h2>What you get</h2>
+  <table>
+    <tr><th>Each board is an interface</th>
+        <td>Plug in two or three and Wireshark lists them all. Capture from several at once and the
+            frames merge into one window, each tagged with the board it came from.</td></tr>
+    <tr><th>Channels, your way</th>
+        <td>One channel (<code>6</code>), several (<code>1,6,11</code>), a range (<code>1-11</code>)
+            or a mix (<code>1-13,36,149-165</code>). Tick them in a list, or type them.</td></tr>
+    <tr><th>Change it live</th>
+        <td><em>View &rarr; Interface Toolbars</em> gives you a channel picker and a dwell time that
+            retune the board mid-capture, without restarting it.</td></tr>
+    <tr><th>Dual band</th>
+        <td>2.4&nbsp;GHz channels 1&ndash;14 and 5&nbsp;GHz 36&ndash;177, on the same board.</td></tr>
+    <tr><th>Radio detail</th>
+        <td>Every frame carries a radiotap header: channel, frequency, signal and noise in dBm, so
+            Wireshark&rsquo;s Wi-Fi columns and filters all work.</td></tr>
+  </table>
+
+  <h2>Set up the Wireshark side</h2>
+  <p>Flashing the board is only half of it. The other half is one command.</p>
+
+  <h3>1. Requirements</h3>
+  <ul>
+    <li><a href="https://www.wireshark.org/download.html">Wireshark</a> 4.2 or newer</li>
+    <li>Python 3.8+ with <code>pyserial</code></li>
+  </ul>
+
+  <h3>2. Register the sniffer with Wireshark</h3>
+<pre><code>git clone https://github.com/oshri-almog/esp32c5-wireshark-sniffer
+cd esp32c5-wireshark-sniffer
+pip install -r requirements.txt
+python extcap/install.py</code></pre>
+  <p>
+    That installs a small launcher into Wireshark&rsquo;s <code>extcap</code> folder and the
+    <strong>WLAN-detail</strong> Wireshark profile (Wi-Fi columns, colouring rules and filter buttons
+    for beacons by Wi-Fi generation, probes, auth, RTS/CTS, ACKs, EAPOL and more). An existing profile
+    of that name is never overwritten.
+  </p>
+
+  <h3>3. Capture</h3>
+  <ol>
+    <li>Open Wireshark. Press <strong>F5</strong> if the board is not in the list yet.</li>
+    <li>Double-click <em>ESP32 Wi-Fi sniffer (COM14, &hellip;)</em>.</li>
+    <li>Use the <strong>gear icon</strong> next to it to pick the serial port, the channels and the
+        dwell time.</li>
+    <li>Turn on <em>View &rarr; Interface Toolbars &rarr; ESP32 Wi-Fi sniffer</em> to change channels
+        while capturing.</li>
+  </ol>
+
+  <div class="ok">
+    <strong>Dark mode tip.</strong> On Windows, Qt draws tick boxes with the system theme and in dark
+    mode an <em>unticked</em> box has no visible outline, which makes the channel list hard to read.
+    Start Wireshark with <code>extcap\wireshark-fusion.bat</code>, or set
+    <code>QT_STYLE_OVERRIDE=Fusion</code> once, and the boxes become visible again without giving up
+    dark mode.
+  </div>
+
+  <h2>Flashing without this page</h2>
+  <p>If you would rather use a terminal, or you are on Safari:</p>
+<pre><code># with ESP-IDF v5.5 or newer
+cd firmware
+idf.py set-target esp32c5
+idf.py -p COM14 flash
+
+# or flash the prebuilt merged image with esptool
+esptool --chip esp32c5 --port COM14 write_flash 0x0 esp32c5-sniffer-1.0.0-merged.bin</code></pre>
+  <p class="muted">
+    <a href="firmware/esp32c5-sniffer-1.0.0-merged.bin">Download the merged firmware image</a>
+    (819&nbsp;KiB, flashes at offset <code>0x0</code>).
+  </p>
+
+  <h2>Troubleshooting</h2>
+  <table>
+    <tr><th>Board missing from Wireshark</th>
+        <td>Press <strong>F5</strong> in Wireshark. Check the board appears as a serial port
+            (USB&nbsp;VID <code>303A</code>, PID <code>1001</code>).</td></tr>
+    <tr><th>&ldquo;Serial connection failed&rdquo;</th>
+        <td>Only one program may hold a serial port. Close any serial monitor, and any second copy of
+            the capture.</td></tr>
+    <tr><th>Random failures, ports renumbering</th>
+        <td>Almost always the USB link. Use a <strong>powered</strong> hub or a direct port, and a
+            known-good data cable. A faulty cable and an unpowered hub cost this project hours of
+            confusing, intermittent errors.</td></tr>
+    <tr><th>Nothing captured</th>
+        <td>Check the channel actually carries traffic, and that the board is not sitting in download
+            mode (power-cycle it).</td></tr>
+    <tr><th>Frames marked malformed</th>
+        <td>A few per thousand is normal: the Wi-Fi driver reports some MIMO frames with metadata that
+            does not match their contents. The rest of the capture is unaffected.</td></tr>
+  </table>
+
+  <h2>How it works</h2>
+<pre><code>Wi-Fi driver --callback--&gt; ring buffer --writer task--&gt; USB-Serial-JTAG
+                                                            |
+                                          extcap plugin (Python) --pipe--&gt; Wireshark</code></pre>
+  <p>
+    The firmware puts the radio in promiscuous mode and writes libpcap records straight to the
+    board&rsquo;s native USB port &mdash; nothing else shares that port, so the byte stream stays
+    clean (logs go to UART instead). A frame is sent whole or dropped whole, so the stream never
+    loses framing, and the host resynchronises on a marker if it ever does.
+  </p>
+
+  <footer>
+    <a href="https://github.com/oshri-almog/esp32c5-wireshark-sniffer">Source on GitHub</a> &middot;
+    MIT licensed &middot;
+    Only capture traffic on networks you own or are authorised to test.
+  </footer>
+
+</main>
+</body>
+</html>

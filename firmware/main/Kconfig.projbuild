@@ -1,0 +1,93 @@
+menu "Packet Sniffer Configuration"
+
+    config SNIFFER_CHANNEL_HOPPING
+        bool "Enable channel hopping"
+        default y
+        help
+            Hop through the channel list, staying SNIFFER_HOP_INTERVAL_MS on each channel.
+            When disabled the sniffer stays on SNIFFER_START_CHANNEL.
+            The host can override this at run time with the "CHANNEL <n>" command
+            (SerialShark.py --channel).
+
+    config SNIFFER_HOP_INTERVAL_MS
+        int "Channel hopping interval (ms)"
+        range 50 60000
+        default 250
+        help
+            Time spent on each channel before moving to the next one.
+
+    config SNIFFER_START_CHANNEL
+        int "Start channel"
+        range 36 177 if SNIFFER_BAND_5G
+        range 1 14 if SNIFFER_BAND_2G
+        range 1 177
+        default 36 if SNIFFER_BAND_5G
+        default 1
+        help
+            Channel used right after boot (and permanently when hopping is disabled).
+            It must be a channel of the band selected below, otherwise the build fails.
+
+    config SNIFFER_2G_MAX_CHANNEL
+        int "Highest 2.4 GHz channel to hop through"
+        range 1 14
+        default 13
+        help
+            The 2.4 GHz part of the hop list is 1..this value. The original Arduino sketch used 11.
+
+    choice SNIFFER_BAND
+        prompt "Bands to sniff"
+        default SNIFFER_BAND_DUAL if SOC_WIFI_SUPPORT_5G
+        default SNIFFER_BAND_2G
+        help
+            The ESP32-C5 radio is dual band but tunes to one channel at a time, so hopping over both
+            bands makes a full lap over the channel list take longer.
+
+        config SNIFFER_BAND_2G
+            bool "2.4 GHz only"
+        config SNIFFER_BAND_5G
+            bool "5 GHz only"
+            depends on SOC_WIFI_SUPPORT_5G
+        config SNIFFER_BAND_DUAL
+            bool "2.4 GHz + 5 GHz"
+            depends on SOC_WIFI_SUPPORT_5G
+    endchoice
+
+    choice SNIFFER_LINKTYPE
+        prompt "PCAP link type"
+        default SNIFFER_LINKTYPE_RADIOTAP
+        help
+            Link type announced in the PCAP global header.
+
+        config SNIFFER_LINKTYPE_RADIOTAP
+            bool "802.11 + radiotap header (127)"
+            help
+                Every frame is prefixed with a radiotap header carrying the channel, RSSI and noise floor,
+                so Wireshark can show on which channel each frame was captured.
+        config SNIFFER_LINKTYPE_IEEE802_11
+            bool "Plain 802.11 (105), as in the Arduino sketch"
+    endchoice
+
+    config SNIFFER_CAPTURE_CTRL_FRAMES
+        bool "Capture control frames (ACK, RTS, CTS, Block Ack, ...)"
+        default y
+        help
+            With this enabled all three 802.11 frame types are captured: management, control and data.
+            Control frames are short but very frequent, roughly one ACK per data frame. The
+            USB-Serial-JTAG link carries a few hundred kB/s, so on a busy channel this raises the
+            number of frames dropped for lack of bandwidth. Turn it off to capture management and
+            data frames only.
+
+    config SNIFFER_RINGBUF_SIZE
+        int "Size of the capture ring buffer (bytes)"
+        range 32768 262144
+        default 65536
+        help
+            Frames wait here between the Wi-Fi driver callback and the USB writer task.
+            The lower bound leaves room for the longest 802.11 frame.
+
+    config SNIFFER_USB_TX_BUF_SIZE
+        int "Size of the USB-Serial-JTAG driver TX buffer (bytes)"
+        range 16384 131072
+        default 32768
+
+endmenu
