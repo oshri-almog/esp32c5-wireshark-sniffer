@@ -1,13 +1,13 @@
 {
   "name": "ESP32-C5 Wireshark Sniffer",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "new_install_prompt_erase": true,
   "new_install_improv_wait_time": 0,
   "builds": [
     {
       "chipFamily": "ESP32-C5",
       "parts": [
-        { "path": "firmware/esp32c5-sniffer-1.0.0-merged.bin", "offset": 0 }
+        { "path": "firmware/esp32c5-sniffer-1.1.0-merged.bin", "offset": 0 }
       ]
     }
   ]

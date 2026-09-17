@@ -38,6 +38,7 @@ over its own USB link — so the channel controls can live in Wireshark after al
 | **Live retuning** | *View → Interface Toolbars* gives a channel picker and dwell time that take effect mid-capture. |
 | **All frame types** | Management, control and data — including ACK, RTS/CTS and Block Ack. |
 | **Radio metadata** | A radiotap header per frame: channel, frequency, signal and noise in dBm. |
+| **Zigbee and Thread** | The same board also sniffs IEEE 802.15.4, channels 11–26, as a second interface per board. Wireshark dissects Zigbee and Thread from it without any extra plugin. |
 
 ## Quick start
 
@@ -92,9 +93,27 @@ The board speaks plain lines over its USB port, so you can drive it from anythin
 | `START [<unix µs>\|0] [<nonce>]` | Begin a stream: marker line, then the PCAP global header. |
 | `CHANNELS <spec>` | Channels to scan (`6`, `1,6,11`, `1-11`, …). `0` or `AUTO` restores the built-in list. |
 | `DWELL <ms>` | Time on each channel, 20–60000 ms. |
+| `MODE WIFI\|802154` | Which radio to listen with. Remembered in flash; changing it reboots the board. |
+| `TXTEST [n]` | **Transmits** `n` 802.15.4 test frames (802.15.4 mode only), so a second board can prove the receive path without any Zigbee hardware around. Nothing else ever transmits. |
 
 Build-time defaults (bands, starting channel, control frames, buffer sizes) are in
 `idf.py menuconfig` → *Packet Sniffer Configuration*.
+
+## Zigbee and Thread
+
+Every board offers a second interface, *ESP32 Zigbee/Thread sniffer*, that captures raw IEEE 802.15.4
+on channels 11–26 and hands Wireshark an
+[802.15.4 TAP](https://www.wireshark.org/docs/dfref/w/wpan-tap.html) header with channel, RSSI, LQI
+and a timestamp. Wireshark dissects Zigbee, 6LoWPAN and Thread from that on its own — nothing else to
+install. Pick the interface and it works like the Wi-Fi one, tick list and toolbar included.
+
+Zigbee traffic above the network layer is encrypted; to read it, put the network key into
+*Preferences → Protocols → ZigBee NWK*. Thread is dissected as 6LoWPAN and IPv6 without a key.
+
+One radio, one protocol: a board captures Wi-Fi **or** 802.15.4, never both at once. Choosing the
+other interface reboots the board, which takes a couple of seconds and is why the radio is picked at
+boot rather than swapped live — handing the antenna over at runtime leaves the PHY in a state that
+only unplugging the board clears.
 
 ## Requirements
 
@@ -112,6 +131,9 @@ Build-time defaults (bands, starting channel, control frames, buffer sizes) are 
 - **Throughput.** USB-Serial-JTAG manages a few hundred kB/s. On a busy channel the firmware drops
   whole frames rather than blocking, so the stream stays valid.
 - **Drop counters go to UART only**, to keep the USB stream free of anything but capture data.
+- **A board that has run 802.15.4 can come back deaf to Wi-Fi.** Rare, and no reset clears it —
+  unplug the board. The firmware shuts the radio down cleanly before rebooting into the other mode,
+  which is what keeps this from happening in normal use.
 
 ## Licence and credits
 

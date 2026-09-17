@@ -114,6 +114,9 @@
     <tr><th>Radio detail</th>
         <td>Every frame carries a radiotap header: channel, frequency, signal and noise in dBm, so
             Wireshark&rsquo;s Wi-Fi columns and filters all work.</td></tr>
+    <tr><th>Zigbee and Thread too</th>
+        <td>The same board sniffs IEEE&nbsp;802.15.4 on channels 11&ndash;26, as a second interface.
+            Wireshark dissects Zigbee, 6LoWPAN and Thread from it with nothing extra installed.</td></tr>
   </table>
 
   <h2>Set up the Wireshark side</h2>
@@ -165,6 +168,25 @@ python extcap/install.py</code></pre>
     </figcaption>
   </figure>
 
+  <h3>4. Zigbee and Thread</h3>
+  <p>
+    Every board is listed twice. The second entry, <em>ESP32 Zigbee/Thread sniffer</em>, captures raw
+    IEEE&nbsp;802.15.4 on channels 11&ndash;26 instead of Wi-Fi. It behaves exactly like the Wi-Fi one
+    &mdash; same tick list, same toolbar &mdash; and Wireshark dissects Zigbee, 6LoWPAN and Thread from
+    it without any extra plugin.
+  </p>
+  <p>
+    A board captures Wi-Fi <em>or</em> 802.15.4, never both: there is one radio and one antenna.
+    Choosing the other interface reboots the board, which takes a second or two before frames appear.
+    That is deliberate &mdash; handing the antenna between the two radios while running leaves the
+    radio in a state that only unplugging the board clears.
+  </p>
+  <p>
+    Zigbee traffic above the network layer is encrypted. To read it, put the network key into
+    <em>Preferences &rarr; Protocols &rarr; ZigBee NWK</em>. Thread shows up as 6LoWPAN and IPv6 with
+    no key needed.
+  </p>
+
   <div class="ok">
     <strong>Dark mode tip.</strong> On Windows, Qt draws tick boxes with the system theme and in dark
     mode an <em>unticked</em> box has no visible outline, which makes the channel list hard to read.
@@ -183,8 +205,8 @@ idf.py -p COM14 flash
 # or flash the prebuilt merged image with esptool
 esptool --chip esp32c5 --port COM14 write_flash 0x0 esp32c5-sniffer-1.0.0-merged.bin</code></pre>
   <p class="muted">
-    <a href="firmware/esp32c5-sniffer-1.0.0-merged.bin">Download the merged firmware image</a>
-    (819&nbsp;KiB, flashes at offset <code>0x0</code>).
+    <a href="firmware/esp32c5-sniffer-1.1.0-merged.bin">Download the merged firmware image</a>
+    (860&nbsp;KiB, flashes at offset <code>0x0</code>).
   </p>
 
   <h2>Troubleshooting</h2>
@@ -202,6 +224,11 @@ esptool --chip esp32c5 --port COM14 write_flash 0x0 esp32c5-sniffer-1.0.0-merged
     <tr><th>Nothing captured</th>
         <td>Check the channel actually carries traffic, and that the board is not sitting in download
             mode (power-cycle it).</td></tr>
+    <tr><th>No Wi-Fi after using the Zigbee/Thread interface</th>
+        <td>Rare, and a reset will not clear it: <strong>unplug the board and plug it back in</strong>.
+            The two radios share one antenna, and a board that has run 802.15.4 can come back deaf to
+            Wi-Fi until it actually loses power. The firmware gives the radio back cleanly before it
+            reboots, which avoids this in normal use.</td></tr>
     <tr><th>Frames marked malformed</th>
         <td>A few per thousand is normal: the Wi-Fi driver reports some MIMO frames with metadata that
             does not match their contents. The rest of the capture is unaffected.</td></tr>

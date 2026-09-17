@@ -16,6 +16,9 @@
  *                                           A list of one channel is a lock. "0" or "AUTO" restores the
  *                                           list from menuconfig. CHANNEL is accepted as the same command.
  *   DWELL <ms>                              time spent on each channel before moving to the next one
+ *   MODE WIFI|802154                        which radio to listen with (802.15.4 is Zigbee and Thread).
+ *                                           Kept in NVS and applied at boot, so asking for the other
+ *                                           radio reboots the board. ZIGBEE and THREAD mean 802154.
  */
 
 #include <stdbool.h>
@@ -31,11 +34,14 @@
 #include "freertos/queue.h"
 #include "freertos/ringbuf.h"
 #include "esp_wifi.h"
+#include "esp_ieee802154.h"
 #include "esp_event.h"
 #include "esp_timer.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
+#include "esp_system.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "driver/usb_serial_jtag.h"
 
 #if !CONFIG_SOC_USB_SERIAL_JTAG_SUPPORTED
@@ -110,13 +116,95 @@ _Static_assert(sizeof(radiotap_hdr_t) == 16, "radiotap header layout");
 #define LINK_HDR_LEN 0
 #endif
 
+/* ---------------------------------------------------------------------------------------------
+ * IEEE 802.15.4: Zigbee and Thread
+ *
+ * Both are carried over 802.15.4, so one sniffer serves both. The board sends the raw MAC frames
+ * and Wireshark works out which stack each frame belongs to.
+ *
+ * Link type 283 is to 802.15.4 what radiotap is to Wi-Fi: TLVs in front of every frame. The
+ * plainer 802.15.4 link types will not do, because
+ *   - the radio hands us no FCS (the hardware checks it, then overwrites those two bytes with the
+ *     RSSI and LQI). A link type that claims an FCS makes Wireshark read them as one, mark every
+ *     frame bad and stop dissecting Zigbee or Thread at all, and
+ *   - there is nowhere else to record which channel a frame was heard on.
+ * ------------------------------------------------------------------------------------------- */
+
+#define PCAP_NETWORK_154 283 /* LINKTYPE_IEEE802_15_4_TAP */
+
+#define TAP_TLV_FCS_TYPE 0x0000
+#define TAP_TLV_RSS 0x0001
+#define TAP_TLV_CH_ASSIGN 0x0003
+#define TAP_TLV_SOF_TS 0x0005
+#define TAP_TLV_LQI 0x000A
+#define TAP_FCS_NONE 0
+
+//Every TLV is type, length, value, padded to a 4 byte boundary, and tap_len counts the 4 byte
+//preamble as well. Wireshark is strict about all of it and shows nothing when it is wrong.
+typedef struct __attribute__((packed)) {
+    uint8_t version; /* must be 0 */
+    uint8_t reserved;
+    uint16_t tap_len;
+
+    uint16_t fcs_type_tlv;
+    uint16_t fcs_type_len;
+    uint8_t fcs_type;
+    uint8_t fcs_type_pad[3];
+
+    uint16_t rss_tlv;
+    uint16_t rss_len;
+    float rss; /* dBm */
+
+    uint16_t ch_tlv;
+    uint16_t ch_len;
+    uint16_t channel;
+    uint8_t ch_page;
+    uint8_t ch_pad;
+
+    uint16_t lqi_tlv;
+    uint16_t lqi_len;
+    uint8_t lqi;
+    uint8_t lqi_pad[3];
+
+    uint16_t sof_tlv;
+    uint16_t sof_len;
+    uint64_t sof_ts_ns;
+} tap154_hdr_t;
+_Static_assert(sizeof(tap154_hdr_t) == 48, "802.15.4 TAP header layout");
+
+//A frame is at most 127 bytes including the 2 byte FCS that never reaches us
+#define MAX_154_MPDU_LEN (127 - 2)
+#define CHANNEL_IS_154(c) ((c) >= 11 && (c) <= 26)
+#define DEFAULT_154_CHANNEL 15 /* a common Zigbee channel; the host usually sets its own anyway */
+
+//Which radio is capturing. The two share one antenna path, and 802.15.4 has the lower priority in
+//the coexistence arbiter, so running both would quietly lose frames. It is one or the other.
+//
+//The radio is chosen once, at boot, and never handed over while running. Doing it at runtime looks
+//like it works, because frames arrive on the radio just started, but it leaves the PHY in a state
+//that no reset clears: two boards switched to 802.15.4 and back captured no Wi-Fi at all afterwards,
+//on firmware that had never been changed, until they were physically unplugged. So MODE writes the
+//wanted radio to NVS and reboots, and each boot initialises exactly one of the two.
+typedef enum {
+    SNIFFER_MODE_WIFI = 0,
+    SNIFFER_MODE_154,
+} sniffer_mode_t;
+
+//Set once in app_main() before any task that reads it exists, so it needs no locking
+static sniffer_mode_t s_mode = SNIFFER_MODE_WIFI;
+
+#define NVS_NAMESPACE "sniffer"
+#define NVS_KEY_MODE "mode"
+
 #define MAX_RECORD_LEN (sizeof(pcap_rec_hdr_t) + LINK_HDR_LEN + MAX_FRAME_LEN)
 //A record is sent with a single all-or-nothing write, and a ring buffer item may not be larger than half
 //the buffer (minus its own 8 byte header), so the largest frame has to fit in both.
 _Static_assert(MAX_RECORD_LEN <= CONFIG_SNIFFER_RINGBUF_SIZE / 2 - 8, "ring buffer too small for one record");
 _Static_assert(MAX_RECORD_LEN <= CONFIG_SNIFFER_USB_TX_BUF_SIZE, "USB TX buffer too small for one record");
+_Static_assert(sizeof(pcap_rec_hdr_t) + sizeof(tap154_hdr_t) + MAX_154_MPDU_LEN < MAX_RECORD_LEN,
+               "an 802.15.4 record must fit in the same buffers as a Wi-Fi one");
 
-static const pcap_global_hdr_t s_pcap_global_hdr = {
+static pcap_global_hdr_t s_pcap_global_hdr = {
     .magic_num = 0xa1b2c3d4,
     .version_major = 2,
     .version_minor = 4,
@@ -182,6 +270,8 @@ static volatile uint8_t s_channel; /* the channel the radio is on right now */
 static void build_default_list(uint8_t *list, size_t *count);
 static bool parse_channel_spec(const char *spec, uint8_t *list, size_t *count);
 static void set_scan_list(const uint8_t *list, size_t count);
+static void save_mode(sniffer_mode_t mode);
+static void wifi_promiscuous_start(void);
 
 /* ---------------------------------------------------------------------------------------------
  * Capture: runs in the Wi-Fi driver task, so it must not block, log or touch the USB port
@@ -264,6 +354,80 @@ static void sniff_out(void *buf, wifi_promiscuous_pkt_type_t type)
     memcpy(item + sizeof(rec) + LINK_HDR_LEN, pak->payload, len);
     xRingbufferSendComplete(s_ringbuf, item);
     s_captured++;
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * IEEE 802.15.4 capture. Unlike the Wi-Fi callback this one runs in the INTERRUPT handler, inside
+ * the driver's own critical section, so it must be in IRAM, must not block, and has to use the
+ * FromISR ring buffer calls. The frame is built in a small stack buffer first because
+ * SendAcquire has no ISR form.
+ * ------------------------------------------------------------------------------------------- */
+
+static void IRAM_ATTR fill_tap154(tap154_hdr_t *t, const esp_ieee802154_frame_info_t *fi)
+{
+    memset(t, 0, sizeof(*t));
+    t->version = 0;
+    t->tap_len = sizeof(*t);
+
+    t->fcs_type_tlv = TAP_TLV_FCS_TYPE;
+    t->fcs_type_len = 1;
+    t->fcs_type = TAP_FCS_NONE; /* the radio really does not give us one */
+
+    t->rss_tlv = TAP_TLV_RSS;
+    t->rss_len = 4;
+    t->rss = (float)fi->rssi;
+
+    t->ch_tlv = TAP_TLV_CH_ASSIGN;
+    t->ch_len = 3;
+    t->channel = fi->channel;
+    t->ch_page = 0;
+
+    t->lqi_tlv = TAP_TLV_LQI;
+    t->lqi_len = 1;
+    t->lqi = fi->lqi;
+
+    t->sof_tlv = TAP_TLV_SOF_TS;
+    t->sof_len = 8;
+    t->sof_ts_ns = fi->timestamp * 1000ULL; /* the driver counts microseconds, the TLV wants ns */
+}
+
+void IRAM_ATTR esp_ieee802154_receive_done(uint8_t *frame, esp_ieee802154_frame_info_t *frame_info)
+{
+    //frame[0] is the PHY length byte and counts the 2 byte FCS, which is not in the buffer: the
+    //hardware has already overwritten those two bytes with the RSSI and the LQI. So the MAC frame
+    //is frame[1] .. frame[len-2], which is len-2 bytes.
+    uint8_t phy_len = frame[0];
+    if (phy_len > 2 && phy_len - 2 <= MAX_154_MPDU_LEN) {
+        uint32_t len = (uint32_t)phy_len - 2;
+        uint32_t incl_len = sizeof(tap154_hdr_t) + len;
+        int64_t now_us = esp_timer_get_time();
+
+        uint8_t item[sizeof(pcap_rec_hdr_t) + sizeof(tap154_hdr_t) + MAX_154_MPDU_LEN];
+        pcap_rec_hdr_t rec = {
+            .incl_len = incl_len,
+            .orig_len = incl_len,
+        };
+        memcpy(&rec.ts_sec, &now_us, sizeof(now_us)); /* raw for now, see finish_record() */
+        memcpy(item, &rec, sizeof(rec));
+        fill_tap154((tap154_hdr_t *)(item + sizeof(rec)), frame_info);
+        memcpy(item + sizeof(rec) + sizeof(tap154_hdr_t), frame + 1, len);
+
+        BaseType_t woken = pdFALSE;
+        if (xRingbufferSendFromISR(s_ringbuf, item, sizeof(rec) + incl_len, &woken) == pdTRUE) {
+            s_captured++;
+        } else {
+            s_dropped_ringbuf++;
+        }
+        if (woken) {
+            portYIELD_FROM_ISR();
+        }
+    } else {
+        s_oversize++;
+    }
+
+    //Must happen on every path. It is the only thing that gives the buffer back, and once all of
+    //them are held the driver silently drops every later frame.
+    esp_ieee802154_receive_handle_done(frame);
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -395,6 +559,77 @@ static void handle_command(char *line)
             return;
         }
         set_scan_list(list, count);
+    } else if (strcmp(cmd, "MODE") == 0) {
+        //Which radio to listen with. This decides the PCAP link type, so the host has to send it
+        //before START. Asking for the radio that is already running costs nothing; asking for the
+        //other one remembers the choice and reboots, because the radio is only chosen at boot.
+        char *what = strtok_r(NULL, " \t\r", &save);
+        sniffer_mode_t wanted;
+        if (what == NULL) {
+            ESP_LOGW(TAG, "MODE needs WIFI or 802154");
+            return;
+        }
+        if (strcasecmp(what, "WIFI") == 0) {
+            wanted = SNIFFER_MODE_WIFI;
+        } else if (strcasecmp(what, "802154") == 0 || strcasecmp(what, "ZIGBEE") == 0
+                   || strcasecmp(what, "THREAD") == 0) {
+            wanted = SNIFFER_MODE_154;
+        } else {
+            ESP_LOGW(TAG, "unknown mode '%s'", what);
+            return;
+        }
+        if (wanted == s_mode) {
+            return; /* already listening with that radio: the common case, and free */
+        }
+        //Give the radio back before the reset takes the firmware away from it. A reset alone leaves
+        //the 802.15.4 blocks powered and configured, and Wi-Fi has been seen to come up deaf after
+        //that, on a board that only removing power would bring back.
+        if (s_mode == SNIFFER_MODE_154) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_ieee802154_disable());
+        } else {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_promiscuous(false));
+            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_stop());
+        }
+        save_mode(wanted);
+        ESP_LOGI(TAG, "restarting to capture with the %s radio",
+                 wanted == SNIFFER_MODE_154 ? "802.15.4" : "Wi-Fi");
+        //Let the log line reach UART0 before the reset cuts it off
+        vTaskDelay(pdMS_TO_TICKS(50));
+        esp_restart();
+    } else if (strcmp(cmd, "TXTEST") == 0) {
+        //Send a few 802.15.4 frames, so a second board can prove the receive path works even when
+        //there is no Zigbee or Thread hardware around to listen to.
+        if (s_mode != SNIFFER_MODE_154) {
+            ESP_LOGW(TAG, "TXTEST only works in 802.15.4 mode");
+            return;
+        }
+        char *count_arg = strtok_r(NULL, " \t\r", &save);
+        int count = count_arg ? atoi(count_arg) : 10;
+        if (count < 1 || count > 1000) {
+            count = 10;
+        }
+        static const char payload[] = "esp32c5-wireshark-sniffer self test";
+        for (int i = 0; i < count; i++) {
+            uint8_t frame[1 + 9 + sizeof(payload) + 2];
+            uint8_t *p = frame + 1;
+            *p++ = 0x41; /* data frame, PAN ID compressed */
+            *p++ = 0x88; /* short destination and source addresses */
+            *p++ = (uint8_t)i;    /* sequence number */
+            *p++ = 0x34; *p++ = 0x12; /* destination PAN 0x1234 */
+            *p++ = 0xff; *p++ = 0xff; /* broadcast */
+            *p++ = 0x01; *p++ = 0x00; /* source address 0x0001 */
+            memcpy(p, payload, sizeof(payload));
+            p += sizeof(payload);
+            //The length byte counts the FCS that the hardware appends for us
+            frame[0] = (uint8_t)(p - frame - 1 + 2);
+            esp_err_t err = esp_ieee802154_transmit(frame, false);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "transmit failed: %s", esp_err_to_name(err));
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        ESP_LOGI(TAG, "sent %d test frames on channel %u", count, s_channel);
     } else if (strcmp(cmd, "DWELL") == 0) {
         char *ms_arg = strtok_r(NULL, " \t\r", &save);
         char *end;
@@ -441,10 +676,18 @@ static void command_task(void *arg)
  * Channel hopping
  * ------------------------------------------------------------------------------------------- */
 
-//The list menuconfig asks for: one channel when hopping is off, otherwise every channel of the chosen bands
+//The list menuconfig asks for: one channel when hopping is off, otherwise every channel of the chosen bands.
+//In 802.15.4 mode the numbering is a different one entirely, so the whole of 11..26 is the sensible start.
 static void build_default_list(uint8_t *list, size_t *count)
 {
     size_t n = 0;
+    if (s_mode == SNIFFER_MODE_154) {
+        for (uint8_t ch = 11; ch <= 26; ch++) {
+            list[n++] = ch;
+        }
+        *count = n;
+        return;
+    }
 #if CONFIG_SNIFFER_CHANNEL_HOPPING
 #if !CONFIG_SNIFFER_BAND_5G
     for (uint8_t ch = 1; ch <= CONFIG_SNIFFER_2G_MAX_CHANNEL; ch++) {
@@ -474,8 +717,15 @@ static void list_add(uint8_t *list, size_t *count, unsigned ch)
     }
 }
 
-//Parse "6", "1,6,11", "1-11" or "1-13,36,149-165". A single number has to be a real channel; a range
-//quietly keeps the real channels inside it, so "36-64" gives 36,40,...,64 and "1-165" gives both bands.
+//Which channels the current radio can tune to. Getting this wrong is not a cosmetic problem:
+//esp_ieee802154_set_channel() asserts on anything outside 11..26 and would panic the board.
+static bool channel_ok(unsigned long ch)
+{
+    return (s_mode == SNIFFER_MODE_154) ? CHANNEL_IS_154(ch) : CHANNEL_IS_VALID(ch);
+}
+
+//Parse "6", "1,6,11", "1-11" or "1-13,36,149-165" (or "11-26" in 802.15.4 mode). A single number has
+//to be a real channel; a range quietly keeps the real ones inside it, so "36-64" gives 36,40,...,64.
 static bool parse_channel_spec(const char *spec, uint8_t *list, size_t *count)
 {
     *count = 0;
@@ -493,12 +743,12 @@ static bool parse_channel_spec(const char *spec, uint8_t *list, size_t *count)
                 return false;
             }
             for (unsigned long ch = lo; ch <= hi; ch++) {
-                if (CHANNEL_IS_VALID(ch)) {
+                if (channel_ok(ch)) {
                     list_add(list, count, ch);
                 }
             }
         } else {
-            if (!CHANNEL_IS_VALID(lo)) {
+            if (!channel_ok(lo)) {
                 return false;
             }
             list_add(list, count, lo);
@@ -538,8 +788,22 @@ static void set_scan_list(const uint8_t *list, size_t count)
 
 static bool set_channel(uint8_t ch)
 {
-    //The secondary channel is not used: 20 MHz in 2.4 GHz, and the driver picks it itself in 5 GHz
-    esp_err_t err = esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    esp_err_t err;
+    if (s_mode == SNIFFER_MODE_154) {
+        if (!CHANNEL_IS_154(ch)) {
+            return false; /* the driver would assert and take the board down with it */
+        }
+        err = esp_ieee802154_set_channel(ch);
+        if (err == ESP_OK) {
+            //esp_ieee802154_set_channel() only stores the number. The radio is not retuned until the
+            //driver next enters receive, which it does here: without this the board answers every
+            //channel change with "fine" and quietly stays on the channel it booted with.
+            err = esp_ieee802154_receive();
+        }
+    } else {
+        //The secondary channel is not used: 20 MHz in 2.4 GHz, and the driver picks it itself in 5 GHz
+        err = esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    }
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "channel %u not set: %s", ch, esp_err_to_name(err));
         return false;
@@ -633,6 +897,11 @@ static void wifi_sniffer_init(void)
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_country_code("01", true));
     }
 
+    wifi_promiscuous_start();
+}
+
+static void wifi_promiscuous_start(void)
+{
     //Management and data frames, aggregated ones included.
     //Not asked for: MISC frames, of which the driver only reports the length and no usable payload, and
     //FCS failed frames, whose bytes are corrupt by definition. Neither can become a valid PCAP record,
@@ -657,6 +926,52 @@ static void wifi_sniffer_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
 }
 
+static void sniffer_154_init(void)
+{
+    ESP_ERROR_CHECK(esp_ieee802154_enable());
+    ESP_ERROR_CHECK(esp_ieee802154_set_promiscuous(true)); /* every frame, not just ours */
+    ESP_ERROR_CHECK(esp_ieee802154_set_coordinator(false));
+    ESP_ERROR_CHECK(esp_ieee802154_set_rx_when_idle(true)); /* keep listening between frames */
+    ESP_ERROR_CHECK(esp_ieee802154_set_channel(DEFAULT_154_CHANNEL));
+    ESP_ERROR_CHECK(esp_ieee802154_receive());
+}
+
+//The radio to use on the next boot. A board that has never been told reports Wi-Fi, so firmware
+//flashed onto a fresh board comes up as a Wi-Fi sniffer without anyone having to ask.
+static sniffer_mode_t load_mode(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        return SNIFFER_MODE_WIFI; /* nothing has ever been stored */
+    }
+    uint8_t stored = SNIFFER_MODE_WIFI;
+    esp_err_t err = nvs_get_u8(nvs, NVS_KEY_MODE, &stored);
+    nvs_close(nvs);
+    if (err != ESP_OK || stored > SNIFFER_MODE_154) {
+        return SNIFFER_MODE_WIFI;
+    }
+    return (sniffer_mode_t)stored;
+}
+
+static void save_mode(sniffer_mode_t mode)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "cannot open NVS to remember the mode: %s", esp_err_to_name(err));
+        return;
+    }
+    err = nvs_set_u8(nvs, NVS_KEY_MODE, (uint8_t)mode);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    if (err != ESP_OK) {
+        //Worth saying out loud: the reboot would otherwise come up in the old mode and look like a hang
+        ESP_LOGE(TAG, "cannot remember the mode: %s", esp_err_to_name(err));
+    }
+}
+
 void app_main(void)
 {
     usb_serial_init();
@@ -668,6 +983,11 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    //Everything below depends on which radio this boot belongs to: the default channel list, the
+    //link type in the PCAP header Wireshark reads first, and which of the two drivers is started.
+    s_mode = load_mode();
+    s_pcap_global_hdr.network = (s_mode == SNIFFER_MODE_154) ? PCAP_NETWORK_154 : PCAP_NETWORK;
 
     s_ringbuf = xRingbufferCreate(CONFIG_SNIFFER_RINGBUF_SIZE, RINGBUF_TYPE_NOSPLIT);
     s_start_queue = xQueueCreate(1, sizeof(start_req_t));
@@ -684,15 +1004,24 @@ void app_main(void)
 
     //The writer sends the start marker and the PCAP global header before the first frame can arrive
     xTaskCreate(serial_writer_task, "serial_writer", 4096, NULL, 6, NULL);
-    wifi_sniffer_init();
+    //Only the radio this boot is for. The other driver is never initialised, which is the whole
+    //point: nothing can hand the antenna over, so nothing can leave it wedged.
+    if (s_mode == SNIFFER_MODE_154) {
+        sniffer_154_init();
+    } else {
+        wifi_sniffer_init();
+    }
     xTaskCreate(channel_hop_task, "channel_hop", 4096, NULL, 4, &s_hop_task);
     xTaskCreate(command_task, "command", 4096, NULL, 5, NULL);
 
+    const char *radio = (s_mode == SNIFFER_MODE_154) ? "802.15.4" : "Wi-Fi";
+    ESP_LOGI(TAG, "capturing with the %s radio", radio);
+
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(10000));
-        ESP_LOGI(TAG, "ch %3u of %u (%" PRIu32 " ms) | captured %" PRIu32
+        ESP_LOGI(TAG, "%s ch %3u of %u (%" PRIu32 " ms) | captured %" PRIu32
                       " | dropped: buffer %" PRIu32 ", usb %" PRIu32 ", oversize %" PRIu32,
-                 s_channel, (unsigned)s_scan_count, s_dwell_ms, s_captured, s_dropped_ringbuf,
+                 radio, s_channel, (unsigned)s_scan_count, s_dwell_ms, s_captured, s_dropped_ringbuf,
                  s_dropped_usb, s_oversize);
     }
 }
