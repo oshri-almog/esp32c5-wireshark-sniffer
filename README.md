@@ -14,6 +14,12 @@ the capture is running.
 
 Both bands, on the same board: 2.4 GHz channels 1–14 and 5 GHz 36–177.
 
+![Four Seeed Studio XIAO ESP32C5 boards, each with an external antenna, plugged into the four ports of a powered USB 3.0 hub](docs/images/multi-esp32c5-interface.jpg)
+
+*Four Seeed Studio XIAO ESP32C5 boards on a powered hub — four Wireshark interfaces, captured at
+once. Use a **powered** hub: an unpowered one browns out under four sniffers and produces failures
+that look like firmware bugs.*
+
 ### ➜ [Flash a board from your browser](https://oshri-almog.github.io/esp32c5-wireshark-sniffer/)
 
 No toolchain needed — Chrome or Edge talks to the board directly.
