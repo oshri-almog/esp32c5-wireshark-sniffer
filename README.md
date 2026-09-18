@@ -131,6 +131,9 @@ only unplugging the board clears.
 - **Throughput.** USB-Serial-JTAG manages a few hundred kB/s. On a busy channel the firmware drops
   whole frames rather than blocking, so the stream stays valid.
 - **Drop counters go to UART only**, to keep the USB stream free of anything but capture data.
+- **A board remembers its radio across reboots.** One last used for Zigbee or Thread comes back in
+  that mode, sends its `<<START>>` marker and header, and then sits quietly on an empty band — which
+  reads as a hang. Wireshark always sets the radio itself; from the command line pass `--mode wifi`.
 - **A board that has run 802.15.4 can come back deaf to Wi-Fi.** Rare, and no reset clears it —
   unplug the board. The firmware shuts the radio down cleanly before rebooting into the other mode,
   which is what keeps this from happening in normal use.

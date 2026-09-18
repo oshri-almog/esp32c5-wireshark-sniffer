@@ -224,6 +224,12 @@ esptool --chip esp32c5 --port COM14 write_flash 0x0 esp32c5-sniffer-1.0.0-merged
     <tr><th>Nothing captured</th>
         <td>Check the channel actually carries traffic, and that the board is not sitting in download
             mode (power-cycle it).</td></tr>
+    <tr><th>A board prints <code>&lt;&lt;START&gt;&gt;</code> and then nothing</th>
+        <td>It is almost certainly listening with the other radio. A board remembers its radio across
+            reboots, so one last used for Zigbee or Thread stays there, sends its marker and header,
+            and then waits on a band with nothing on it. Nothing is wrong with it. Wireshark sets the
+            radio itself, so this only bites in a serial monitor or with
+            <code>host/sniffer.py</code> &mdash; pass <code>--mode wifi</code> to bring it back.</td></tr>
     <tr><th>No Wi-Fi after using the Zigbee/Thread interface</th>
         <td>Rare, and a reset will not clear it: <strong>unplug the board and plug it back in</strong>.
             The two radios share one antenna, and a board that has run 802.15.4 can come back deaf to
