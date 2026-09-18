@@ -62,15 +62,20 @@ PROFILE_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 # Channel lists
 # ----------------------------------------------------------------------------------------------
 
-MODE_WIFI, MODE_154 = "wifi", "802154"
+MODE_WIFI, MODE_154, MODE_BLE = "wifi", "802154", "ble"
 
 
 def channel_is_valid(ch, mode=MODE_WIFI):
     """The channels an ESP32 radio can tune to (same rule as the firmware).
 
-    The two radios number their channels differently and the ranges overlap, so 11 to 14 mean one
-    thing on Wi-Fi and another on 802.15.4. Which radio is meant has to be said, not guessed.
+    The radios number their channels differently and the ranges overlap, so 11 to 14 mean one thing
+    on Wi-Fi and another on 802.15.4. Which radio is meant has to be said, not guessed.
+
+    Bluetooth LE accepts only 37. Its three advertising channels are 37, 38 and 39, but the
+    controller scans all of them and will not be restricted to one, so 37 stands for the set.
     """
+    if mode == MODE_BLE:
+        return ch == 37
     if mode == MODE_154:
         return 11 <= ch <= 26
     return (1 <= ch <= 14
@@ -85,8 +90,10 @@ def parse_channel_spec(spec, mode=MODE_WIFI):
     A single number has to be a real channel; a range keeps the real channels inside it, so "36-64"
     gives 36, 40 ... 64. Duplicates are dropped so no channel gets two turns in a lap.
     """
-    what = "802.15.4" if mode == MODE_154 else "Wi-Fi"
-    allowed = "11-26" if mode == MODE_154 else "1-14, or 36-177 in steps of 4"
+    what = {MODE_154: "802.15.4", MODE_BLE: "Bluetooth LE"}.get(mode, "Wi-Fi")
+    allowed = {MODE_154: "11-26",
+               MODE_BLE: "37 only: the controller scans all three advertising channels"}.get(
+                   mode, "1-14, or 36-177 in steps of 4")
     channels = []
     for part in str(spec).split(","):
         part = part.strip()
@@ -419,9 +426,10 @@ def parse_args():
                          "(1-13,36,149-165). Default: whatever the firmware was built with.")
     ap.add_argument("-d", "--dwell", type=int, metavar="MS",
                     help="time spent on each channel before hopping to the next one, in ms")
-    ap.add_argument("-m", "--mode", choices=["wifi", "802154"],
-                    help="radio to capture with: wifi, or 802154 for Zigbee and Thread. The board "
-                         "reboots if this is not the one it is already using. Default: leave it alone.")
+    ap.add_argument("-m", "--mode", choices=["wifi", "802154", "ble"],
+                    help="radio to capture with: wifi, 802154 for Zigbee and Thread, or ble for "
+                         "Bluetooth LE advertising. The board reboots if this is not the one it is "
+                         "already using. Default: leave it alone.")
     ap.add_argument("--reset", action="store_true", help="reset the board (RTS pulse) after opening the port")
     ap.add_argument("--no-handshake", action="store_true",
                     help="only wait for the <<START>> line printed at boot (original Arduino firmware)")

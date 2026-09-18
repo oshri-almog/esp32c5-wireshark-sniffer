@@ -45,6 +45,7 @@ over its own USB link — so the channel controls can live in Wireshark after al
 | **All frame types** | Management, control and data — including ACK, RTS/CTS and Block Ack. |
 | **Radio metadata** | A radiotap header per frame: channel, frequency, signal and noise in dBm. |
 | **Zigbee and Thread** | The same board also sniffs IEEE 802.15.4, channels 11–26, as a second interface per board. Wireshark dissects Zigbee and Thread from it without any extra plugin. |
+| **Bluetooth LE advertising** | A third interface per board captures BLE advertising — beacons, trackers, and whatever a device broadcasts before anyone connects to it. Advertising only, not connections. |
 
 ## Quick start
 
@@ -99,7 +100,7 @@ The board speaks plain lines over its USB port, so you can drive it from anythin
 | `START [<unix µs>\|0] [<nonce>]` | Begin a stream: marker line, then the PCAP global header. |
 | `CHANNELS <spec>` | Channels to scan (`6`, `1,6,11`, `1-11`, …). `0` or `AUTO` restores the built-in list. |
 | `DWELL <ms>` | Time on each channel, 20–60000 ms. |
-| `MODE WIFI\|802154` | Which radio to listen with. Remembered in flash; changing it reboots the board. |
+| `MODE WIFI\|802154\|BLE` | Which radio to listen with. Remembered in flash; changing it reboots the board. |
 | `TXTEST [n]` | **Transmits** `n` 802.15.4 test frames (802.15.4 mode only), so a second board can prove the receive path without any Zigbee hardware around. Nothing else ever transmits. |
 
 Build-time defaults (bands, starting channel, control frames, buffer sizes) are in
@@ -116,10 +117,35 @@ install. Pick the interface and it works like the Wi-Fi one, tick list and toolb
 Zigbee traffic above the network layer is encrypted; to read it, put the network key into
 *Preferences → Protocols → ZigBee NWK*. Thread is dissected as 6LoWPAN and IPv6 without a key.
 
-One radio, one protocol: a board captures Wi-Fi **or** 802.15.4, never both at once. Choosing the
-other interface reboots the board, which takes a couple of seconds and is why the radio is picked at
-boot rather than swapped live — handing the antenna over at runtime leaves the PHY in a state that
-only unplugging the board clears.
+One radio, one protocol: a board captures Wi-Fi **or** 802.15.4 **or** Bluetooth, never two at once.
+Choosing another interface reboots the board, which takes a couple of seconds and is why the radio is
+picked at boot rather than swapped live — handing the antenna over at runtime leaves the PHY in a
+state that only unplugging the board clears.
+
+## Bluetooth LE
+
+A third interface, *ESP32 Bluetooth LE advertising sniffer*, captures BLE advertising and hands
+Wireshark a [BLE link-layer pseudo-header](https://www.tcpdump.org/linktypes.html) (DLT 256) — the
+same format Nordic's sniffer produces, so the ordinary Bluetooth dissectors name the addresses,
+device names, manufacturer data and iBeacon payloads for you.
+
+**It captures advertising, not connections.** Once two devices pair up and move to the data channels
+they disappear from the capture. That is the hardware, not the firmware: the ESP32-C5 has no
+promiscuous mode for Bluetooth — there is no `esp_ble_set_promiscuous()` to match the Wi-Fi one, on
+this chip or any other Espressif part — only a passive scan. It also has **no Bluetooth Classic**
+(BR/EDR) at all. To follow connections you need hardware that hops with them, such as an nRF52840
+running [Nordic's nRF Sniffer](https://www.nordicsemi.com/Products/Development-tools/nRF-Sniffer-for-Bluetooth-LE),
+which ships its own Wireshark plugin.
+
+Two consequences worth knowing:
+
+- **No channel choice.** The controller scans advertising channels 37, 38 and 39 together and will
+  not be restricted to one, so this interface has no channel list. NimBLE offers
+  `ble_gap_set_scan_chan()` for exactly that, but its own header says "supported only for ESP32C2",
+  and the C5 answers it with `BLE_ERR_UNKNOWN_HCI_CMD`.
+- **No per-packet channel, and no CRC.** No HCI advertising report carries either, so every packet is
+  recorded as channel 37 and the CRC flags are left clear rather than claiming a check that never
+  happened.
 
 ## Requirements
 

@@ -34,9 +34,14 @@ ACCEPT = [
     ("20", "802154", [20]),
     ("15,20,25", "802154", [15, 20, 25]),
     ("11", "802154", [11]),
+    # Bluetooth LE takes 37 and nothing else. Its advertising channels are 37, 38 and 39, but the
+    # controller scans all three and refuses to be restricted to one, so 37 stands for the set
+    # rather than for a choice between them.
+    ("37", "ble", [37]),
 ]
 
-REJECT = [("20", "wifi"), ("27", "802154"), ("10", "802154"), ("37", "wifi")]
+REJECT = [("20", "wifi"), ("27", "802154"), ("10", "802154"), ("37", "wifi"),
+          ("38", "ble"), ("39", "ble"), ("11", "ble"), ("6", "ble")]
 
 # What the settings dialog, the toolbar and the command line each hand to the plugin
 EXTCAP = [
@@ -44,6 +49,7 @@ EXTCAP = [
     ("g154,20", "802154", [20]),
     ("1,6,11", "wifi", [1, 6, 11]),
     ("20", "802154", [20]),
+    ("37", "ble", [37]),
 ]
 
 

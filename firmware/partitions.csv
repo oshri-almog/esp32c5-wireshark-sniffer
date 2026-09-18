@@ -1,0 +1,8 @@
+# The default single-app table gives the app 1 MB, which the Wi-Fi, 802.15.4 and Bluetooth LE
+# stacks together do not fit into. This one hands the app everything else in a 2 MB flash, so the
+# image still works on any ESP32-C5 module with 2 MB or more.
+#
+# Name,     Type, SubType,  Offset,   Size
+nvs,        data, nvs,      0x9000,   0x6000
+phy_init,   data, phy,      0xf000,   0x1000
+factory,    app,  factory,  0x10000,  0x1F0000

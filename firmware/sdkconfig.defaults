@@ -1,4 +1,4 @@
-# Target: ESP32-C5 (run `idf.py set-target esp32c5` once; this line makes it the default)
+﻿# Target: ESP32-C5 (run `idf.py set-target esp32c5` once; this line makes it the default)
 CONFIG_IDF_TARGET="esp32c5"
 
 # The native USB port (USB-Serial-JTAG) carries ONLY the binary PCAP stream.
@@ -22,3 +22,21 @@ CONFIG_SNIFFER_CAPTURE_CTRL_FRAMES=y
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=24
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=64
 CONFIG_ESP_WIFI_RX_MGMT_BUF_NUM_DEF=10
+
+# Bluetooth LE, for the advertising sniffer. NimBLE rather than Bluedroid: it is the smaller of the
+# two by a wide margin, and it still offers ble_gap_set_scan_chan(), which is what lets the host
+# pick advertising channels 37, 38 and 39 the same way it picks Wi-Fi ones.
+#
+# Observer only. The sniffer never advertises, never connects and never pairs, so every other role
+# is switched off -- it keeps the radio silent and saves the flash those roles would cost.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=n
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
+
+
+# The three stacks together do not fit the default 1 MB app partition; see partitions.csv
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

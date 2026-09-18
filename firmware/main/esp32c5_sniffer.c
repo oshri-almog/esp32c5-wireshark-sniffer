@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Wi-Fi packet sniffer that streams a live PCAP capture to Wireshark (through SerialShark.py).
  *
  * ESP-IDF port, for the ESP32-C5, of the CprE 543 Arduino sketch.
@@ -16,9 +16,10 @@
  *                                           A list of one channel is a lock. "0" or "AUTO" restores the
  *                                           list from menuconfig. CHANNEL is accepted as the same command.
  *   DWELL <ms>                              time spent on each channel before moving to the next one
- *   MODE WIFI|802154                        which radio to listen with (802.15.4 is Zigbee and Thread).
- *                                           Kept in NVS and applied at boot, so asking for the other
- *                                           radio reboots the board. ZIGBEE and THREAD mean 802154.
+ *   MODE WIFI|802154|BLE                    which radio to listen with (802.15.4 is Zigbee and Thread,
+ *                                           BLE is Bluetooth LE advertising). Kept in NVS and applied
+ *                                           at boot, so asking for another radio reboots the board.
+ *                                           ZIGBEE and THREAD mean 802154; BT and BLUETOOTH mean BLE.
  */
 
 #include <stdbool.h>
@@ -35,6 +36,10 @@
 #include "freertos/ringbuf.h"
 #include "esp_wifi.h"
 #include "esp_ieee802154.h"
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "host/ble_gap.h"
 #include "esp_event.h"
 #include "esp_timer.h"
 #include "esp_log.h"
@@ -177,6 +182,47 @@ _Static_assert(sizeof(tap154_hdr_t) == 48, "802.15.4 TAP header layout");
 #define CHANNEL_IS_154(c) ((c) >= 11 && (c) <= 26)
 #define DEFAULT_154_CHANNEL 15 /* a common Zigbee channel; the host usually sets its own anyway */
 
+/* ---------------------------------------------------------------------------------------------
+ * Bluetooth LE: advertising
+ *
+ * What this is, and what it is not. The radio has no promiscuous mode for Bluetooth -- there is no
+ * esp_ble_set_promiscuous() to match the Wi-Fi one, on this chip or any other Espressif part. What
+ * it does have is a passive scan, which hands over every advertising packet it hears without ever
+ * transmitting. So this captures advertising: beacons, trackers, and everything a device says
+ * before anyone talks to it. It cannot follow a connection, so once two devices pair up and move
+ * to the data channels they go silent as far as this is concerned. For that you need hardware that
+ * hops with them, such as an nRF52840 running Nordic's sniffer firmware.
+ *
+ * Link type 256 carries a small pseudo-header in front of each packet, the same one the nRF
+ * sniffer produces, so Wireshark dissects what we send with its ordinary BTLE dissector.
+ * ------------------------------------------------------------------------------------------- */
+
+#define PCAP_NETWORK_BLE 256 /* LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR */
+
+//Advertising uses three channels, numbered 37, 38 and 39 above the 37 data channels
+#define CHANNEL_IS_BLE(c) ((c) >= 37 && (c) <= 39)
+#define DEFAULT_BLE_CHANNEL 37
+
+//Every advertising packet starts with this, by definition: it is fixed by the specification
+#define BLE_ADV_ACCESS_ADDRESS 0x8E89BED6u
+#define BLE_CRC_LEN 3
+//An advertising payload is 6 bytes of address plus at most 31 of data, after a 2 byte header
+#define MAX_BLE_PDU_LEN (2 + 6 + 6 + 31)
+
+typedef struct __attribute__((packed)) {
+    uint8_t rf_channel;     /* the RF index, not the advertising channel number: see ble_rf_channel() */
+    int8_t signal_dbm;
+    int8_t noise_dbm;
+    uint8_t aa_offenses;
+    uint32_t ref_access_address;
+    uint16_t flags;
+} ble_phdr_t;
+_Static_assert(sizeof(ble_phdr_t) == 10, "Bluetooth LE pseudo-header layout");
+
+#define BLE_PHDR_DEWHITENED 0x0001
+#define BLE_PHDR_SIGNAL_VALID 0x0002
+#define BLE_PHDR_REF_AA_VALID 0x0010
+
 //Which radio is capturing. The two share one antenna path, and 802.15.4 has the lower priority in
 //the coexistence arbiter, so running both would quietly lose frames. It is one or the other.
 //
@@ -188,7 +234,9 @@ _Static_assert(sizeof(tap154_hdr_t) == 48, "802.15.4 TAP header layout");
 typedef enum {
     SNIFFER_MODE_WIFI = 0,
     SNIFFER_MODE_154,
+    SNIFFER_MODE_BLE,
 } sniffer_mode_t;
+#define SNIFFER_MODE_MAX SNIFFER_MODE_BLE
 
 //Set once in app_main() before any task that reads it exists, so it needs no locking
 static sniffer_mode_t s_mode = SNIFFER_MODE_WIFI;
@@ -203,6 +251,8 @@ _Static_assert(MAX_RECORD_LEN <= CONFIG_SNIFFER_RINGBUF_SIZE / 2 - 8, "ring buff
 _Static_assert(MAX_RECORD_LEN <= CONFIG_SNIFFER_USB_TX_BUF_SIZE, "USB TX buffer too small for one record");
 _Static_assert(sizeof(pcap_rec_hdr_t) + sizeof(tap154_hdr_t) + MAX_154_MPDU_LEN < MAX_RECORD_LEN,
                "an 802.15.4 record must fit in the same buffers as a Wi-Fi one");
+_Static_assert(sizeof(pcap_rec_hdr_t) + sizeof(ble_phdr_t) + 4 + MAX_BLE_PDU_LEN + BLE_CRC_LEN
+               < MAX_RECORD_LEN, "a Bluetooth LE record must fit in the same buffers as a Wi-Fi one");
 
 static pcap_global_hdr_t s_pcap_global_hdr = {
     .magic_num = 0xa1b2c3d4,
@@ -272,6 +322,7 @@ static bool parse_channel_spec(const char *spec, uint8_t *list, size_t *count);
 static void set_scan_list(const uint8_t *list, size_t count);
 static void save_mode(sniffer_mode_t mode);
 static void wifi_promiscuous_start(void);
+static bool ble_start_scan(void);
 
 /* ---------------------------------------------------------------------------------------------
  * Capture: runs in the Wi-Fi driver task, so it must not block, log or touch the USB port
@@ -431,6 +482,124 @@ void IRAM_ATTR esp_ieee802154_receive_done(uint8_t *frame, esp_ieee802154_frame_
 }
 
 /* ---------------------------------------------------------------------------------------------
+ * Bluetooth LE capture: runs in the NimBLE host task, so it may block but must not dawdle
+ * ------------------------------------------------------------------------------------------- */
+
+//Advertising channels 37, 38 and 39 are not RF channels 37, 38 and 39. They sit at 2402, 2426 and
+//2480 MHz, which are RF indices 0, 12 and 39, and the pseudo-header wants the RF index. This is
+//not cosmetic: Wireshark uses it to decide whether a packet is an advertising or a data channel
+//one, so an advertising PDU labelled 37 is read as a data PDU and its type comes out "Unknown".
+static uint8_t ble_rf_channel(uint8_t adv_channel)
+{
+    switch (adv_channel) {
+    case 37: return 0;
+    case 38: return 12;
+    default: return 39;
+    }
+}
+
+//The controller reports what it heard, not the bytes it heard, so the advertising PDU has to be
+//put back together from the pieces. Everything needed is there: the type, the address and whether
+//it was random, and the payload exactly as transmitted.
+static uint8_t ble_pdu_type(uint8_t event_type)
+{
+    switch (event_type) {
+    case BLE_HCI_ADV_RPT_EVTYPE_ADV_IND:     return 0x0;
+    case BLE_HCI_ADV_RPT_EVTYPE_DIR_IND:     return 0x1;
+    case BLE_HCI_ADV_RPT_EVTYPE_NONCONN_IND: return 0x2;
+    case BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP:    return 0x4;
+    case BLE_HCI_ADV_RPT_EVTYPE_SCAN_IND:    return 0x6;
+    default:                                 return 0x0;
+    }
+}
+
+static void sniff_ble(const struct ble_gap_disc_desc *d)
+{
+    const bool directed = (d->event_type == BLE_HCI_ADV_RPT_EVTYPE_DIR_IND);
+    const uint8_t data_len = directed ? 0 : d->length_data;
+    if (data_len > 31) {
+        s_oversize++;
+        return;
+    }
+
+    uint8_t pdu[MAX_BLE_PDU_LEN];
+    //Header: type in the low nibble, TxAdd (bit 6) set when the advertiser's address is random,
+    //RxAdd (bit 7) the same for the target of a directed advertisement.
+    uint8_t head = ble_pdu_type(d->event_type);
+    if (d->addr.type == BLE_ADDR_RANDOM || d->addr.type == BLE_ADDR_RANDOM_ID) {
+        head |= 0x40;
+    }
+    if (directed && (d->direct_addr.type == BLE_ADDR_RANDOM ||
+                     d->direct_addr.type == BLE_ADDR_RANDOM_ID)) {
+        head |= 0x80;
+    }
+
+    //NimBLE keeps addresses in on-air order already, so they go straight in
+    size_t n = 2;
+    memcpy(pdu + n, d->addr.val, 6);
+    n += 6;
+    if (directed) {
+        memcpy(pdu + n, d->direct_addr.val, 6);
+        n += 6;
+    } else if (data_len) {
+        memcpy(pdu + n, d->data, data_len);
+        n += data_len;
+    }
+    pdu[0] = head;
+    pdu[1] = (uint8_t)(n - 2);
+
+    const uint32_t incl_len = sizeof(ble_phdr_t) + 4 + n + BLE_CRC_LEN;
+    int64_t now_us = esp_timer_get_time();
+
+    uint8_t item[sizeof(pcap_rec_hdr_t) + sizeof(ble_phdr_t) + 4 + MAX_BLE_PDU_LEN + BLE_CRC_LEN];
+    pcap_rec_hdr_t rec = {
+        .incl_len = incl_len,
+        .orig_len = incl_len,
+    };
+    memcpy(&rec.ts_sec, &now_us, sizeof(now_us)); /* raw for now, see finish_record() */
+    memcpy(item, &rec, sizeof(rec));
+
+    //Two things this header cannot tell the truth about, both because the controller does not know
+    //them either:
+    //  - the channel. No HCI advertising report carries one, and the scan covers all three anyway,
+    //    so every packet is reported as channel 37. Wireshark needs a valid advertising channel
+    //    here or it reads the PDU as a data channel one and cannot name its type at all.
+    //  - the CRC. A passive scan never sees it, so the bytes are zero and the "CRC checked" and
+    //    "CRC valid" flags stay clear rather than claiming a check that never happened.
+    ble_phdr_t phdr = {
+        .rf_channel = ble_rf_channel(DEFAULT_BLE_CHANNEL),
+        .signal_dbm = d->rssi,
+        .noise_dbm = 0,
+        .aa_offenses = 0,
+        .ref_access_address = BLE_ADV_ACCESS_ADDRESS,
+        .flags = BLE_PHDR_DEWHITENED | BLE_PHDR_SIGNAL_VALID | BLE_PHDR_REF_AA_VALID,
+    };
+    uint8_t *p = item + sizeof(rec);
+    memcpy(p, &phdr, sizeof(phdr));
+    p += sizeof(phdr);
+    const uint32_t aa = BLE_ADV_ACCESS_ADDRESS;
+    memcpy(p, &aa, sizeof(aa));
+    p += sizeof(aa);
+    memcpy(p, pdu, n);
+    p += n;
+    memset(p, 0, BLE_CRC_LEN); /* we do not have it, and the flags above say so */
+
+    if (xRingbufferSend(s_ringbuf, item, sizeof(rec) + incl_len, 0) == pdTRUE) {
+        s_captured++;
+    } else {
+        s_dropped_ringbuf++;
+    }
+}
+
+static int ble_gap_event(struct ble_gap_event *event, void *arg)
+{
+    if (event->type == BLE_GAP_EVENT_DISC) {
+        sniff_ble(&event->disc);
+    }
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------------------------
  * Serial output: the writer task is the only one that writes to the USB port
  * ------------------------------------------------------------------------------------------- */
 
@@ -574,6 +743,9 @@ static void handle_command(char *line)
         } else if (strcasecmp(what, "802154") == 0 || strcasecmp(what, "ZIGBEE") == 0
                    || strcasecmp(what, "THREAD") == 0) {
             wanted = SNIFFER_MODE_154;
+        } else if (strcasecmp(what, "BLE") == 0 || strcasecmp(what, "BT") == 0
+                   || strcasecmp(what, "BLUETOOTH") == 0) {
+            wanted = SNIFFER_MODE_BLE;
         } else {
             ESP_LOGW(TAG, "unknown mode '%s'", what);
             return;
@@ -586,6 +758,9 @@ static void handle_command(char *line)
         //that, on a board that only removing power would bring back.
         if (s_mode == SNIFFER_MODE_154) {
             ESP_ERROR_CHECK_WITHOUT_ABORT(esp_ieee802154_disable());
+        } else if (s_mode == SNIFFER_MODE_BLE) {
+            ble_gap_disc_cancel();
+            nimble_port_stop();
         } else {
             ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_promiscuous(false));
             ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_stop());
@@ -688,6 +863,13 @@ static void build_default_list(uint8_t *list, size_t *count)
         *count = n;
         return;
     }
+    if (s_mode == SNIFFER_MODE_BLE) {
+        //One entry, because the radio has no choice to offer: see ble_start_scan(). The scan
+        //covers 37, 38 and 39 whatever this says.
+        list[n++] = DEFAULT_BLE_CHANNEL;
+        *count = n;
+        return;
+    }
 #if CONFIG_SNIFFER_CHANNEL_HOPPING
 #if !CONFIG_SNIFFER_BAND_5G
     for (uint8_t ch = 1; ch <= CONFIG_SNIFFER_2G_MAX_CHANNEL; ch++) {
@@ -721,7 +903,11 @@ static void list_add(uint8_t *list, size_t *count, unsigned ch)
 //esp_ieee802154_set_channel() asserts on anything outside 11..26 and would panic the board.
 static bool channel_ok(unsigned long ch)
 {
-    return (s_mode == SNIFFER_MODE_154) ? CHANNEL_IS_154(ch) : CHANNEL_IS_VALID(ch);
+    switch (s_mode) {
+    case SNIFFER_MODE_154: return CHANNEL_IS_154(ch);
+    case SNIFFER_MODE_BLE: return ch == DEFAULT_BLE_CHANNEL; /* the radio offers no choice */
+    default:               return CHANNEL_IS_VALID(ch);
+    }
 }
 
 //Parse "6", "1,6,11", "1-11" or "1-13,36,149-165" (or "11-26" in 802.15.4 mode). A single number has
@@ -800,6 +986,11 @@ static bool set_channel(uint8_t ch)
             //channel change with "fine" and quietly stays on the channel it booted with.
             err = esp_ieee802154_receive();
         }
+    } else if (s_mode == SNIFFER_MODE_BLE) {
+        //Nothing to tune: the controller scans all three advertising channels and will not be told
+        //to do otherwise. The list is a single entry so the hop task settles and stops asking.
+        s_channel = DEFAULT_BLE_CHANNEL;
+        return ch == DEFAULT_BLE_CHANNEL && ble_start_scan();
     } else {
         //The secondary channel is not used: 20 MHz in 2.4 GHz, and the driver picks it itself in 5 GHz
         err = esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
@@ -936,6 +1127,54 @@ static void sniffer_154_init(void)
     ESP_ERROR_CHECK(esp_ieee802154_receive());
 }
 
+//Start listening. There is deliberately no channel argument.
+//
+//NimBLE offers ble_gap_set_scan_chan(), which would restrict the scan to one advertising channel,
+//and its own header says it is "currently supported only for ESP32C2". That is accurate: on the
+//ESP32-C5 the controller answers the vendor command with BLE_ERR_UNKNOWN_HCI_CMD. So the scan
+//covers all three advertising channels and there is nothing to tune.
+//
+//The controller does not say which channel a packet arrived on either -- no HCI advertising
+//report carries one, legacy or extended -- so the pseudo-header reports 37 for every packet. See
+//sniff_ble(), where that is spelled out rather than quietly assumed.
+static bool ble_start_scan(void)
+{
+    const struct ble_gap_disc_params params = {
+        .itvl = 0,               /* let the controller choose; it then listens continuously */
+        .window = 0,
+        .filter_policy = 0,      /* everything, not just a white list */
+        .limited = 0,
+        .passive = 1,            /* never transmit: a sniffer that sends scan requests is not a sniffer */
+        .filter_duplicates = 0,  /* every packet, not one report per device */
+    };
+    int rc = ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &params, ble_gap_event, NULL);
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
+        ESP_LOGW(TAG, "Bluetooth scan did not start: rc=%d", rc);
+        return false;
+    }
+    return true;
+}
+
+//NimBLE calls this once the controller is up; nothing can be asked of the radio before it does
+static void ble_on_sync(void)
+{
+    ESP_LOGI(TAG, "Bluetooth controller ready, scanning all three advertising channels");
+    ble_start_scan();
+}
+
+static void ble_host_task(void *param)
+{
+    nimble_port_run(); /* returns only when the host is stopped */
+    nimble_port_freertos_deinit();
+}
+
+static void sniffer_ble_init(void)
+{
+    ESP_ERROR_CHECK(nimble_port_init());
+    ble_hs_cfg.sync_cb = ble_on_sync;
+    nimble_port_freertos_init(ble_host_task);
+}
+
 //The radio to use on the next boot. A board that has never been told reports Wi-Fi, so firmware
 //flashed onto a fresh board comes up as a Wi-Fi sniffer without anyone having to ask.
 static sniffer_mode_t load_mode(void)
@@ -947,7 +1186,7 @@ static sniffer_mode_t load_mode(void)
     uint8_t stored = SNIFFER_MODE_WIFI;
     esp_err_t err = nvs_get_u8(nvs, NVS_KEY_MODE, &stored);
     nvs_close(nvs);
-    if (err != ESP_OK || stored > SNIFFER_MODE_154) {
+    if (err != ESP_OK || stored > SNIFFER_MODE_MAX) {
         return SNIFFER_MODE_WIFI;
     }
     return (sniffer_mode_t)stored;
@@ -987,7 +1226,11 @@ void app_main(void)
     //Everything below depends on which radio this boot belongs to: the default channel list, the
     //link type in the PCAP header Wireshark reads first, and which of the two drivers is started.
     s_mode = load_mode();
-    s_pcap_global_hdr.network = (s_mode == SNIFFER_MODE_154) ? PCAP_NETWORK_154 : PCAP_NETWORK;
+    switch (s_mode) {
+    case SNIFFER_MODE_154: s_pcap_global_hdr.network = PCAP_NETWORK_154; break;
+    case SNIFFER_MODE_BLE: s_pcap_global_hdr.network = PCAP_NETWORK_BLE; break;
+    default:               s_pcap_global_hdr.network = PCAP_NETWORK; break;
+    }
 
     s_ringbuf = xRingbufferCreate(CONFIG_SNIFFER_RINGBUF_SIZE, RINGBUF_TYPE_NOSPLIT);
     s_start_queue = xQueueCreate(1, sizeof(start_req_t));
@@ -1004,17 +1247,18 @@ void app_main(void)
 
     //The writer sends the start marker and the PCAP global header before the first frame can arrive
     xTaskCreate(serial_writer_task, "serial_writer", 4096, NULL, 6, NULL);
-    //Only the radio this boot is for. The other driver is never initialised, which is the whole
+    //Only the radio this boot is for. The other drivers are never initialised, which is the whole
     //point: nothing can hand the antenna over, so nothing can leave it wedged.
-    if (s_mode == SNIFFER_MODE_154) {
-        sniffer_154_init();
-    } else {
-        wifi_sniffer_init();
+    switch (s_mode) {
+    case SNIFFER_MODE_154: sniffer_154_init(); break;
+    case SNIFFER_MODE_BLE: sniffer_ble_init(); break;
+    default:               wifi_sniffer_init(); break;
     }
     xTaskCreate(channel_hop_task, "channel_hop", 4096, NULL, 4, &s_hop_task);
     xTaskCreate(command_task, "command", 4096, NULL, 5, NULL);
 
-    const char *radio = (s_mode == SNIFFER_MODE_154) ? "802.15.4" : "Wi-Fi";
+    const char *radio = (s_mode == SNIFFER_MODE_154) ? "802.15.4"
+                      : (s_mode == SNIFFER_MODE_BLE) ? "Bluetooth LE" : "Wi-Fi";
     ESP_LOGI(TAG, "capturing with the %s radio", radio);
 
     for (;;) {

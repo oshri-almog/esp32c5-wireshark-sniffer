@@ -48,11 +48,16 @@ STALL_TIMEOUT = 6.0
 
 LINKTYPE_IEEE802_11_RADIOTAP = 127
 LINKTYPE_IEEE802_15_4_TAP = 283
+LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR = 256
 
-# A board can listen with its Wi-Fi radio or with its 802.15.4 one, but not both: they share the
-# antenna path and 802.15.4 loses the arbitration, so running both would quietly drop frames. Each
-# board therefore offers one interface per radio, and only one of them can capture at a time.
-MODE_WIFI, MODE_154 = "wifi", "802154"
+# A board listens with one of its three radios, never two: they share the antenna path, so running
+# more than one would quietly drop packets. Each board therefore offers one interface per radio, and
+# only one of them can capture at a time -- picking another reboots the board into that mode.
+#
+# "channels": False means the radio offers no choice of channel, so the settings dialog leaves the
+# tick list out rather than showing a control that cannot do anything. Bluetooth LE is the case:
+# the controller scans all three advertising channels and will not be told to do otherwise.
+MODE_WIFI, MODE_154, MODE_BLE = "wifi", "802154", "ble"
 MODES = {
     MODE_WIFI: {
         "suffix": "",
@@ -61,6 +66,7 @@ MODES = {
         "dlt_name": "IEEE802_11_RADIOTAP",
         "dlt_display": "802.11 plus radiotap header",
         "default_channels": "1,6,11",
+        "channels": True,
     },
     MODE_154: {
         "suffix": "-154",
@@ -69,6 +75,16 @@ MODES = {
         "dlt_name": "IEEE802_15_4_TAP",
         "dlt_display": "IEEE 802.15.4 plus TAP pseudo-header",
         "default_channels": "11-26",
+        "channels": True,
+    },
+    MODE_BLE: {
+        "suffix": "-ble",
+        "label": "Bluetooth LE advertising sniffer",
+        "linktype": LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR,
+        "dlt_name": "BLUETOOTH_LE_LL_WITH_PHDR",
+        "dlt_display": "Bluetooth LE link layer plus pseudo-header",
+        "default_channels": "37",
+        "channels": False,
     },
 }
 # The PCAP file header Wireshark expects before any packet. We send it ourselves the moment the capture
@@ -93,12 +109,20 @@ GROUP_IDS = {gid for gid, _, _ in CHANNEL_GROUPS + CHANNEL_GROUPS_154}
 
 
 def mode_of(interface):
-    """Which radio an interface name asks for."""
-    return MODE_154 if (interface or "").endswith(MODES[MODE_154]["suffix"]) else MODE_WIFI
+    """Which radio an interface name asks for. Wi-Fi has no suffix, so it is what is left over."""
+    name = interface or ""
+    for mode, spec in MODES.items():
+        if spec["suffix"] and name.endswith(spec["suffix"]):
+            return mode
+    return MODE_WIFI
 
 
 def groups_for(mode):
-    return CHANNEL_GROUPS_154 if mode == MODE_154 else CHANNEL_GROUPS
+    if mode == MODE_154:
+        return CHANNEL_GROUPS_154
+    if mode == MODE_BLE:
+        return []
+    return CHANNEL_GROUPS
 
 
 def channel_ok_for(mode, channel):
@@ -212,8 +236,9 @@ def port_for_interface(interface, explicit_port):
             return p.device
     # The board was unplugged, or moved and reports no serial number: fall back to the name it had.
     bare = (interface or "")
-    if bare.endswith(MODES[MODE_154]["suffix"]):
-        bare = bare[:-len(MODES[MODE_154]["suffix"])]
+    suffix = MODES[mode]["suffix"]
+    if suffix and bare.endswith(suffix):
+        bare = bare[:-len(suffix)]
     m = re.fullmatch(r"esp32-((?:com|tty|cu\.)\S+)", bare, re.IGNORECASE)
     if m:
         return m.group(1).upper() if m.group(1).lower().startswith("com") else m.group(1)
@@ -227,10 +252,10 @@ def port_for_interface(interface, explicit_port):
 def extcap_interfaces():
     out("extcap {version=1.0}{display=ESP32 sniffer}"
         "{help=https://github.com/oshri-almog/esp32c5-wireshark-sniffer}")
-    # Each board appears once per radio: Wi-Fi and 802.15.4 (Zigbee/Thread). Only one of the two can
-    # capture at a time, because they share the antenna.
+    # Each board appears once per radio: Wi-Fi, 802.15.4 (Zigbee/Thread) and Bluetooth LE. Only one
+    # of the three can capture at a time, because they share the antenna.
     for p in find_boards():
-        for mode in (MODE_WIFI, MODE_154):
+        for mode in (MODE_WIFI, MODE_154, MODE_BLE):
             out("interface {value=%s}{display=%s}" % (board_id(p, mode), board_label(p, mode)))
 
     # The toolbar under View -> Interface Toolbars
@@ -268,6 +293,16 @@ def extcap_config(interface):
     for p in boards:
         out("value {arg=0}{value=%s}{display=%s}%s"
             % (p.device, board_label(p, mode), "{default=true}" if p.device == current else ""))
+
+    if not MODES[mode]["channels"]:
+        # No tick list: this radio has no channel to choose. Say so where it will be read, rather
+        # than showing a control that does nothing.
+        out("arg {number=1}{call=--note}{display=Channels}{type=string}{group=Scanning}"
+            "{default=all three advertising channels (37, 38, 39)}"
+            "{tooltip=The Bluetooth controller listens on all three advertising channels and cannot "
+            "be restricted to one, so there is nothing to choose here. It also does not report which "
+            "of them a packet arrived on, so every packet is recorded as channel 37.}")
+        return
 
     # Tick list of channels, grouped by band. Ticking a heading takes everything under it.
     default_ticks = set(parse_channel_spec_safe(MODES[mode]["default_channels"], mode))
@@ -494,7 +529,7 @@ def send_start(ser, state):
     # Write errors are deliberately not caught here. A board that has just rebooted is most often
     # found by a write failing, and swallowing that left the capture holding a dead port for good.
     # The caller treats it as a disconnect and reopens.
-    cmd = b"MODE %s\n" % (b"802154" if state["mode"] == MODE_154 else b"WIFI")
+    cmd = b"MODE %s\n" % {MODE_154: b"802154", MODE_BLE: b"BLE"}.get(state["mode"], b"WIFI")
     ser.write(cmd)
     time.sleep(0.3)
     cmd = b"CHANNELS %s\n" % str(state["channels"]).encode()
@@ -537,6 +572,7 @@ def main():
     ap.add_argument("--port")
     ap.add_argument("--channels", default=DEFAULT_CHANNELS)
     ap.add_argument("--preset", default="")
+    ap.add_argument("--note", default="")  # the read-only line shown where a radio has no channels
     ap.add_argument("--dwell", type=int, default=DEFAULT_DWELL)
     ap.add_argument("-h", "--help", action="store_true")
     args, _unknown = ap.parse_known_args()
@@ -557,8 +593,16 @@ def main():
         if not args.fifo:
             sys.exit("--capture needs --fifo")
         mode = mode_of(args.extcap_interface)
-        if args.channels == DEFAULT_CHANNELS and mode == MODE_154:
+        if args.channels == DEFAULT_CHANNELS and mode != MODE_WIFI:
             args.channels = MODES[mode]["default_channels"]  # the Wi-Fi default means nothing here
+        if not MODES[mode]["channels"]:
+            # Nothing to choose, so nothing to parse: the board is told the one value it accepts
+            extcap_capture.control_in = args.extcap_control_in
+            extcap_capture.control_out = args.extcap_control_out
+            extcap_capture(args.extcap_interface, args.fifo,
+                           port_for_interface(args.extcap_interface, args.port),
+                           MODES[mode]["default_channels"], args.dwell, mode)
+            return 0
         if args.preset and mode == MODE_WIFI:
             channels = args.preset                      # a ready-made list wins over the ticks
             if not parse_channel_spec_safe(channels, mode):
