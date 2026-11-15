@@ -257,6 +257,10 @@ esptool --chip esp32c5 --port COM14 write_flash 0x0 esp32c5-sniffer-1.2.0-merged
     <tr><th>&ldquo;Serial connection failed&rdquo;</th>
         <td>Only one program may hold a serial port. Close any serial monitor, and any second copy of
             the capture.</td></tr>
+    <tr><th>Linux: listed, but nothing captured</th>
+        <td>Your user may not open <code>/dev/ttyACM*</code>. Add yourself to the group that owns it,
+            <code>sudo usermod -aG dialout $USER</code> (<code>uucp</code> on Arch), then log out and
+            back in. The toolbar&rsquo;s <em>Status</em> shows <em>Permission denied</em> until then.</td></tr>
     <tr><th>Random failures, ports renumbering</th>
         <td>Almost always the USB link. Use a <strong>powered</strong> hub or a direct port, and a
             known-good data cable. A faulty cable and an unpowered hub cost this project hours of

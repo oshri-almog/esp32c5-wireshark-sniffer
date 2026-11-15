@@ -154,6 +154,17 @@ Two consequences worth knowing:
 - **Python** 3.8+ with `pyserial`
 - **ESP-IDF** v5.5+ only if you want to build the firmware yourself
 
+On **Linux** the board appears as `/dev/ttyACM0`, and only members of the group that owns it may
+open it: `dialout` on Debian, Ubuntu and Fedora, `uucp` on Arch. Add yourself once, then log out and
+back in:
+
+```bash
+sudo usermod -aG dialout $USER     # or uucp on Arch
+```
+
+Without that the board is still listed in Wireshark, but the capture stays empty: the plugin cannot
+open the port, and the toolbar's *Status* says *Permission denied*.
+
 ## Known limitations
 
 - **One channel at a time per board.** The radio is single-tuner; hopping trades coverage for
