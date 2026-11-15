@@ -266,7 +266,8 @@ static pcap_global_hdr_t s_pcap_global_hdr = {
 
 typedef struct {
     bool has_time;
-    int64_t epoch_us;
+    int64_t epoch_us; /* the host's clock when it sent START */
+    int64_t board_us; /* ours when START arrived, which is the moment epoch_us describes */
     char nonce[NONCE_MAX_LEN + 1];
 } start_req_t;
 
@@ -638,8 +639,12 @@ static void restart_stream(const start_req_t *req)
     while ((item = xRingbufferReceive(s_ringbuf, &size, 0)) != NULL) {
         vRingbufferReturnItem(s_ringbuf, item);
     }
+    //The offset pairs the host's time with ours at the moment START arrived. Reading our clock here
+    //instead would pair it with the moment this task got round to it, which is up to a ring buffer
+    //wait later on a quiet channel: every timestamp then came out that much early, by a different
+    //amount on each board, and frames from several boards no longer lined up.
     if (req->has_time) {
-        s_time_offset_us = req->epoch_us - esp_timer_get_time();
+        s_time_offset_us = req->epoch_us - req->board_us;
     }
     if (!send_start(req->nonce)) {
         ESP_LOGW(TAG, "start marker not sent, is the host reading the port?");
@@ -700,7 +705,7 @@ static void handle_command(char *line)
     }
 
     if (strcmp(cmd, "START") == 0) {
-        start_req_t req = { 0 };
+        start_req_t req = { .board_us = esp_timer_get_time() }; /* first, before anything can delay it */
         char *time_arg = strtok_r(NULL, " \t\r", &save);
         char *nonce_arg = strtok_r(NULL, " \t\r", &save);
         if (time_arg) {
