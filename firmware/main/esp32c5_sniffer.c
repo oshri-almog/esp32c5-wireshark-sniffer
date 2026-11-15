@@ -415,7 +415,7 @@ static void sniff_out(void *buf, wifi_promiscuous_pkt_type_t type)
  * SendAcquire has no ISR form.
  * ------------------------------------------------------------------------------------------- */
 
-static void IRAM_ATTR fill_tap154(tap154_hdr_t *t, const esp_ieee802154_frame_info_t *fi)
+static void IRAM_ATTR fill_tap154(tap154_hdr_t *t, const esp_ieee802154_frame_info_t *fi, int64_t start_us)
 {
     memset(t, 0, sizeof(*t));
     t->version = 0;
@@ -440,28 +440,43 @@ static void IRAM_ATTR fill_tap154(tap154_hdr_t *t, const esp_ieee802154_frame_in
 
     t->sof_tlv = TAP_TLV_SOF_TS;
     t->sof_len = 8;
-    t->sof_ts_ns = fi->timestamp * 1000ULL; /* the driver counts microseconds, the TLV wants ns */
+    t->sof_ts_ns = (uint64_t)start_us * 1000ULL; /* the record's own time, in ns as the TLV wants */
+}
+
+//When the frame began. The driver notes the time at the start of frame delimiter, which is the
+//moment an 802.15.4 capture is meant to report; by the time this callback runs, the whole frame
+//has gone by as well (4 ms for a long one) and the interrupt has waited its turn. Its value is
+//only trusted when it plausibly belongs to this frame, so a stale one never moves a frame around.
+static int64_t IRAM_ATTR frame_start_us(const esp_ieee802154_frame_info_t *fi)
+{
+    int64_t now_us = esp_timer_get_time();
+    int64_t sfd_us = (int64_t)fi->timestamp;
+    if (sfd_us > 0 && sfd_us <= now_us && now_us - sfd_us < 20000) {
+        return sfd_us;
+    }
+    return now_us;
 }
 
 void IRAM_ATTR esp_ieee802154_receive_done(uint8_t *frame, esp_ieee802154_frame_info_t *frame_info)
 {
     //frame[0] is the PHY length byte and counts the 2 byte FCS, which is not in the buffer: the
     //hardware has already overwritten those two bytes with the RSSI and the LQI. So the MAC frame
-    //is frame[1] .. frame[len-2], which is len-2 bytes.
-    uint8_t phy_len = frame[0];
+    //is frame[1] .. frame[len-2], which is len-2 bytes. The top bit of that byte is reserved, not
+    //part of the length, and the driver masks it off the same way.
+    uint8_t phy_len = frame[0] & 0x7f;
     if (phy_len > 2 && phy_len - 2 <= MAX_154_MPDU_LEN) {
         uint32_t len = (uint32_t)phy_len - 2;
         uint32_t incl_len = sizeof(tap154_hdr_t) + len;
-        int64_t now_us = esp_timer_get_time();
+        int64_t start_us = frame_start_us(frame_info);
 
         uint8_t item[sizeof(pcap_rec_hdr_t) + sizeof(tap154_hdr_t) + MAX_154_MPDU_LEN];
         pcap_rec_hdr_t rec = {
             .incl_len = incl_len,
             .orig_len = incl_len,
         };
-        memcpy(&rec.ts_sec, &now_us, sizeof(now_us)); /* raw for now, see finish_record() */
+        memcpy(&rec.ts_sec, &start_us, sizeof(start_us)); /* raw for now, see finish_record() */
         memcpy(item, &rec, sizeof(rec));
-        fill_tap154((tap154_hdr_t *)(item + sizeof(rec)), frame_info);
+        fill_tap154((tap154_hdr_t *)(item + sizeof(rec)), frame_info, start_us);
         memcpy(item + sizeof(rec) + sizeof(tap154_hdr_t), frame + 1, len);
 
         BaseType_t woken = pdFALSE;
